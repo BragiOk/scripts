@@ -11,5 +11,5 @@ curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_FILE"
 echo "Делаем скрипт исполняемым..."
 chmod +x "$SCRIPT_FILE"
 
-echo "Запускаем скрипт..."
-bash -i ./"$SCRIPT_FILE"
+#echo "Запускаем скрипт..."
+#bash -i ./"$SCRIPT_FILE"
