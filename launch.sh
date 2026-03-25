@@ -12,4 +12,4 @@ echo "Делаем скрипт исполняемым..."
 chmod +x "$SCRIPT_FILE"
 
 echo "Запускаем скрипт..."
-exec bash ./"$SCRIPT_FILE"
+exec bash -i ./"$SCRIPT_FILE"
