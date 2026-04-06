@@ -475,6 +475,8 @@ services:
     image: remnawave/node:latest
     restart: always
     network_mode: host
+    cap_add:
+      - NET_ADMIN
     environment:
       - NODE_PORT=${port}
       - SECRET_KEY=${secret}
