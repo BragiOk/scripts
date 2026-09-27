@@ -49,6 +49,28 @@ DEFAULT_LOGROTATE_REVERT=y             # подтверждение удален
 # --- Проверка после запуска второй ноды (конфликт в host-сети) ---
 POST_START_CHECK_SECONDS=10
 
+# --- IPv6 ---
+DISABLE_IPV6_ON_INSTALL=1              # 1 — при установке ноды отключать IPv6 (sysctl, сохраняется после перезагрузки); 0 — не трогать
+IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-remnanode-disable-ipv6.conf"
+
+# --- Фаервол (ufw; на RHEL/Fedora — firewalld) ---
+FIREWALL_ON_INSTALL=1                  # 1 — при установке ноды открыть SSH и NODE_PORT (+80/tcp для Hysteria2)
+FIREWALL_INSTALL_ADD_DEFAULT_PORTS=1   # 1 — при установке ноды заодно открыть DEFAULT_FIREWALL_PORTS
+DEFAULT_ENABLE_FIREWALL_ON_INSTALL=y   # включить фаервол при установке, если он выключен (ответ по Enter)
+SSH_PORT=""                            # пусто — определить автоматически (текущая SSH-сессия, sshd -T, sshd_config)
+PANEL_IP=""                            # IP панели: NODE_PORT открывается только для него; пусто — спросить при установке
+
+# Порты по умолчанию — открываются одной командой («Управление фаерволом → 6») и при установке ноды.
+# Формат: "порт" (tcp+udp), "порт/tcp", "порт/udp", "начало:конец/udp".
+# Сюда же добавьте порты inbound'ов из профилей Xray на панели.
+DEFAULT_FIREWALL_PORTS=(
+  "443/tcp"    # VLESS Reality / TLS
+  "443/udp"    # Hysteria2
+  "8443/tcp"
+  "6443/tcp"
+  "55410/tcp"  
+)
+
 # =============================================================================
 # Ротация логов на хосте (access.log / error.log в каталоге ./log рядом с compose)
 # Используется системный logrotate с copytruncate (копия + обнуление текущего файла),
@@ -115,6 +137,17 @@ usage() {
   hy2 cert-mode    сменить режим получения сертификата (только 80 / 80+443)
   hy2 cert         статус сертификата
   hy2              меню ноды Hysteria2
+
+IPv6:
+  ipv6 [status|disable|enable]
+
+Фаервол (ufw; на RHEL/Fedora — firewalld):
+  firewall status             статус и правила
+  firewall enable|disable     включить (SSH открывается автоматически) / выключить
+  firewall allow <порт> [IP]  открыть порт: 8443, 8443/tcp, 20000:30000/udp
+  firewall delete             удалить правило (выбор по номеру)
+  firewall defaults           открыть SSH + DEFAULT_FIREWALL_PORTS
+  firewall nodes              открыть SSH + NODE_PORT обеих нод + 80/tcp для Hysteria2
 
   help             эта справка
 
@@ -525,7 +558,10 @@ ask_node_port() {
 }
 
 remind_panel_port() {
-  say "На панели в настройках этой ноды должен быть указан порт $1; в фаерволе откройте $1/tcp только для IP панели."
+  say "На панели в настройках этой ноды должен быть указан порт $1."
+  if [[ "$FIREWALL_ON_INSTALL" != "1" ]]; then
+    say "В фаерволе откройте $1/tcp только для IP панели («Управление фаерволом»)."
+  fi
 }
 
 # =============================================================================
@@ -1384,6 +1420,657 @@ EOF
 }
 
 # =============================================================================
+# Общее: Linux, root, «мягкие» шаги
+# =============================================================================
+is_linux() { [[ "$(uname -s)" == "Linux" ]]; }
+
+require_linux() { is_linux || die "Эта функция работает только на Linux."; }
+
+# root без запроса пароля (для статусов в меню, чтобы не дёргать sudo).
+can_root_quiet() { [[ "$(id -u)" -eq 0 ]] || sudo -n true 2>/dev/null; }
+
+# Выполнить шаг; ошибка не прерывает установку, а выводит предупреждение.
+soft_step() {
+  local msg="$1" rc
+  shift
+  set +e
+  (
+    set -e
+    "$@"
+  )
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || warn "$msg"
+  return 0
+}
+
+# =============================================================================
+# IPv6
+# =============================================================================
+IPV6_MARKER="REMNANODE_SH_IPV6_MANAGED"
+
+ipv6_state() {
+  if [[ ! -e /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
+    echo kernel
+  elif [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == "1" ]]; then
+    echo off
+  else
+    echo on
+  fi
+}
+
+ipv6_status_line() {
+  is_linux || {
+    echo "не Linux"
+    return
+  }
+  case "$(ipv6_state)" in
+    kernel) echo "отключён в ядре" ;;
+    off)
+      if [[ -f "$IPV6_SYSCTL_FILE" ]]; then echo "отключён"; else echo "отключён до перезагрузки"; fi
+      ;;
+    on)
+      if [[ -f "$IPV6_SYSCTL_FILE" ]]; then echo "включён (отключится после перезагрузки)"; else echo "включён"; fi
+      ;;
+  esac
+}
+
+# SSH-сессия идёт по IPv6 — отключение её оборвёт.
+ssh_over_ipv6() {
+  [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+  local srv
+  srv="$(awk '{print $3}' <<<"$SSH_CONNECTION")"
+  [[ "$srv" == *:* && "$srv" != ::ffff:* ]]
+}
+
+# Другие sysctl-файлы, которые задают противоположное значение.
+ipv6_conflicts() {
+  local want="$1" other=1 f
+  [[ "$want" == "1" ]] && other=0
+  for f in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf; do
+    [[ -f "$f" && "$f" != "$IPV6_SYSCTL_FILE" ]] || continue
+    if grep -qE "^[[:space:]]*net\.ipv6\.conf\.[a-z0-9._-]+\.disable_ipv6[[:space:]]*=[[:space:]]*${other}" "$f" 2>/dev/null; then
+      warn "в $f задано disable_ipv6 = $other — может переопределить настройку после перезагрузки."
+    fi
+  done
+  return 0
+}
+
+ipv6_show_status() {
+  require_linux
+  say "IPv6: $(ipv6_status_line)"
+  [[ -f "$IPV6_SYSCTL_FILE" ]] && say "Файл настройки: $IPV6_SYSCTL_FILE"
+  if [[ "$(ipv6_state)" == "on" ]] && command -v ip >/dev/null 2>&1; then
+    local addrs
+    addrs="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print "  " $2}' || true)"
+    if [[ -n "$addrs" ]]; then
+      say "Глобальные IPv6-адреса:"
+      say "$addrs"
+    else
+      say "Глобальных IPv6-адресов нет."
+    fi
+  fi
+}
+
+# $1=auto — вызов при установке (без вопросов; при SSH по IPv6 — пропуск).
+ipv6_disable() {
+  local auto="${1:-}" tmp i
+  require_linux
+  if [[ "$(ipv6_state)" == "kernel" ]]; then
+    say "IPv6 уже отключён в ядре (ipv6.disable=1)."
+    return 0
+  fi
+  if [[ "$(ipv6_state)" == "off" && -f "$IPV6_SYSCTL_FILE" ]]; then
+    say "IPv6 уже отключён."
+    return 0
+  fi
+  if ssh_over_ipv6; then
+    warn "вы подключены по SSH через IPv6 — после отключения сессия оборвётся."
+    if [[ -n "$auto" ]]; then
+      say "IPv6 не отключаю. Сделайте это позже из меню («Управление IPv6»), подключившись по IPv4."
+      return 0
+    fi
+    prompt_yes_no "Всё равно отключить?" n || {
+      say "Отмена."
+      return 0
+    }
+  fi
+  tmp="$(mktemp)"
+  {
+    echo "# ${IPV6_MARKER}"
+    echo "# Создано ${SCRIPT_NAME}: отключение IPv6. Вернуть — «Управление IPv6 → Включить»."
+    for i in all default lo; do
+      echo "net.ipv6.conf.${i}.disable_ipv6 = 1"
+    done
+  } >"$tmp"
+  if ! run_as_root tee "$IPV6_SYSCTL_FILE" <"$tmp" >/dev/null; then
+    rm -f "$tmp"
+    die "Не удалось записать $IPV6_SYSCTL_FILE"
+  fi
+  rm -f "$tmp"
+  run_as_root chmod 0644 "$IPV6_SYSCTL_FILE" 2>/dev/null || true
+  run_as_root sysctl -q -p "$IPV6_SYSCTL_FILE" >/dev/null || warn "sysctl -p завершился с ошибкой."
+  if [[ "$(ipv6_state)" == "off" ]]; then
+    say "IPv6 отключён (сохранится после перезагрузки: $IPV6_SYSCTL_FILE)."
+  else
+    warn "IPv6 не отключился — проверьте: sysctl net.ipv6.conf.all.disable_ipv6"
+  fi
+  ipv6_conflicts 1
+}
+
+ipv6_enable() {
+  local f
+  require_linux
+  if [[ "$(ipv6_state)" == "kernel" ]]; then
+    warn "IPv6 отключён в ядре (параметр загрузки ipv6.disable=1)."
+    say "  Уберите его из GRUB_CMDLINE_LINUX в /etc/default/grub, выполните update-grub и перезагрузите сервер."
+    return 0
+  fi
+  if [[ -f "$IPV6_SYSCTL_FILE" ]]; then
+    if grep -qF "$IPV6_MARKER" "$IPV6_SYSCTL_FILE" 2>/dev/null; then
+      run_as_root rm -f "$IPV6_SYSCTL_FILE"
+      say "Удалён $IPV6_SYSCTL_FILE"
+    else
+      warn "$IPV6_SYSCTL_FILE создан не этим скриптом — не удаляю."
+    fi
+  fi
+  for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [[ -f "$f" ]] || continue
+    echo 0 | run_as_root tee "$f" >/dev/null 2>&1 || true
+  done
+  if [[ "$(ipv6_state)" == "on" ]]; then
+    say "IPv6 включён."
+    say "Если IPv6-адреса не появились — перезапустите сеть (netplan apply / systemctl restart networking) или перезагрузите сервер."
+  else
+    warn "IPv6 не включился — проверьте: sysctl net.ipv6.conf.all.disable_ipv6"
+  fi
+  ipv6_conflicts 0
+}
+
+ipv6_on_install() {
+  [[ "$DISABLE_IPV6_ON_INSTALL" == "1" ]] || return 0
+  is_linux || return 0
+  if [[ "$(ipv6_state)" == "kernel" ]] || [[ "$(ipv6_state)" == "off" && -f "$IPV6_SYSCTL_FILE" ]]; then
+    return 0
+  fi
+  say ""
+  say "=== IPv6: отключаю (DISABLE_IPV6_ON_INSTALL=1) ==="
+  soft_step "не удалось отключить IPv6 — можно сделать позже из меню." ipv6_disable auto
+}
+
+# =============================================================================
+# Фаервол (ufw; на RHEL/Fedora — firewalld)
+# =============================================================================
+fw_backend() {
+  if command -v ufw >/dev/null 2>&1 || [[ -x /usr/sbin/ufw ]]; then
+    echo ufw
+  elif command -v firewall-cmd >/dev/null 2>&1 || [[ -x /usr/bin/firewall-cmd ]]; then
+    echo firewalld
+  else
+    echo none
+  fi
+}
+
+fw_install() {
+  if command -v apt-get >/dev/null 2>&1; then
+    prompt_yes_no "Фаервол ufw не установлен. Установить?" y || return 1
+    run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+  elif command -v dnf >/dev/null 2>&1; then
+    prompt_yes_no "Фаервол firewalld не установлен. Установить?" y || return 1
+    run_as_root dnf install -y firewalld
+  elif command -v yum >/dev/null 2>&1; then
+    prompt_yes_no "Фаервол firewalld не установлен. Установить?" y || return 1
+    run_as_root yum install -y firewalld
+  elif command -v apk >/dev/null 2>&1; then
+    prompt_yes_no "Фаервол ufw не установлен. Установить?" y || return 1
+    run_as_root apk add --no-cache ufw
+  else
+    warn "не знаю, как установить фаервол на этой системе (нужен ufw или firewalld)."
+    return 1
+  fi
+  [[ "$(fw_backend)" != "none" ]]
+}
+
+fw_require() {
+  require_linux
+  if [[ "$(fw_backend)" == "none" ]]; then
+    fw_install || die "Фаервол не установлен."
+  fi
+}
+
+# firewalld: постоянные правила (работает и при остановленном firewalld).
+fwc() {
+  if run_as_root firewall-cmd --state >/dev/null 2>&1; then
+    run_as_root firewall-cmd --permanent "$@"
+  elif command -v firewall-offline-cmd >/dev/null 2>&1 || [[ -x /usr/bin/firewall-offline-cmd ]]; then
+    run_as_root firewall-offline-cmd "$@"
+  else
+    warn "firewalld не запущен и нет firewall-offline-cmd."
+    return 1
+  fi
+}
+
+fw_reload() {
+  if [[ "$(fw_backend)" == "firewalld" ]] && run_as_root firewall-cmd --state >/dev/null 2>&1; then
+    run_as_root firewall-cmd --reload >/dev/null
+  fi
+  return 0
+}
+
+fw_active() {
+  case "$(fw_backend)" in
+    ufw)
+      local out
+      out="$(run_as_root env LC_ALL=C ufw status 2>/dev/null || true)"
+      [[ "$out" == *"Status: active"* ]]
+      ;;
+    firewalld) run_as_root firewall-cmd --state >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+fw_status_line() {
+  is_linux || {
+    echo "не Linux"
+    return
+  }
+  local b
+  b="$(fw_backend)"
+  if [[ "$b" == "none" ]]; then
+    echo "не установлен"
+  elif ! can_root_quiet; then
+    echo "$b"
+  elif fw_active; then
+    echo "$b · включён"
+  else
+    echo "$b · выключен"
+  fi
+}
+
+ssh_ports() {
+  if [[ -n "$SSH_PORT" ]]; then
+    echo "$SSH_PORT"
+    return
+  fi
+  local ports="" p sshd_bin=""
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    p="$(awk '{print $4}' <<<"$SSH_CONNECTION")"
+    valid_port "$p" && ports="$ports $p"
+  fi
+  if command -v sshd >/dev/null 2>&1; then
+    sshd_bin="$(command -v sshd)"
+  elif [[ -x /usr/sbin/sshd ]]; then
+    sshd_bin=/usr/sbin/sshd
+  fi
+  if [[ -n "$sshd_bin" ]] && can_root_quiet; then
+    p="$(run_as_root "$sshd_bin" -T 2>/dev/null | awk '$1=="port"{print $2}' || true)"
+    ports="$ports $p"
+  fi
+  if [[ -z "$(trim "$ports")" ]]; then
+    p="$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk 'tolower($1)=="port"{print $2}' || true)"
+    ports="$ports $p"
+  fi
+  # shellcheck disable=SC2086
+  ports="$(printf '%s\n' $ports | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
+  ports="$(trim "$ports")"
+  echo "${ports:-22}"
+}
+
+fw_spec_valid() {
+  local s="$1" a b
+  [[ "$s" =~ ^[0-9]+(:[0-9]+)?(/(tcp|udp))?$ ]] || return 1
+  a="${s%%/*}"
+  if [[ "$a" == *:* ]]; then
+    [[ "$s" == */* ]] || return 1 # диапазон — только с протоколом
+    b="${a#*:}"
+    a="${a%%:*}"
+    valid_port "$a" && valid_port "$b" && [ "$a" -lt "$b" ]
+  else
+    valid_port "$a"
+  fi
+}
+
+valid_ip_or_cidr() {
+  [[ "$1" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] && [[ "$1" == *.* || "$1" == *:* ]]
+}
+
+# Открыть порт. $1 — «порт[/proto]» или «a:b/proto», $2 — источник (IP/подсеть, пусто — все), $3 — комментарий.
+fw_allow() {
+  local spec="$1" from="${2:-}" comment="${3:-remnanode.sh}" port proto="" pr p2 fam
+  port="${spec%%/*}"
+  [[ "$spec" == */* ]] && proto="${spec#*/}"
+  case "$(fw_backend)" in
+    ufw)
+      if [[ -n "$from" && -n "$proto" ]]; then
+        run_as_root ufw allow from "$from" to any port "$port" proto "$proto" comment "$comment" >/dev/null
+      elif [[ -n "$from" ]]; then
+        run_as_root ufw allow from "$from" to any port "$port" comment "$comment" >/dev/null
+      else
+        run_as_root ufw allow "$spec" comment "$comment" >/dev/null
+      fi
+      ;;
+    firewalld)
+      p2="${port/:/-}"
+      for pr in ${proto:-tcp udp}; do
+        if [[ -n "$from" ]]; then
+          fam=ipv4
+          [[ "$from" == *:* ]] && fam=ipv6
+          fwc --add-rich-rule="rule family=\"$fam\" source address=\"$from\" port port=\"$p2\" protocol=\"$pr\" accept" >/dev/null
+        else
+          fwc --add-port="$p2/$pr" >/dev/null
+        fi
+      done
+      ;;
+    *) return 1 ;;
+  esac
+  say "  открыт: $spec${from:+ (только с $from)}"
+}
+
+# Тихо удалить правило для порта (при смене NODE_PORT).
+fw_delete_port_quiet() {
+  local port="$1" from="${2:-}" fam
+  case "$(fw_backend)" in
+    ufw)
+      run_as_root ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+      if [[ -n "$from" ]]; then
+        run_as_root ufw delete allow from "$from" to any port "$port" proto tcp >/dev/null 2>&1 || true
+      fi
+      ;;
+    firewalld)
+      fwc --remove-port="$port/tcp" >/dev/null 2>&1 || true
+      if [[ -n "$from" ]]; then
+        fam=ipv4
+        [[ "$from" == *:* ]] && fam=ipv6
+        fwc --remove-rich-rule="rule family=\"$fam\" source address=\"$from\" port port=\"$port\" protocol=\"tcp\" accept" >/dev/null 2>&1 || true
+      fi
+      ;;
+  esac
+  return 0
+}
+
+fw_allow_ssh() {
+  local p
+  for p in $(ssh_ports); do
+    fw_allow "$p/tcp" "" "SSH"
+  done
+}
+
+fw_enable() {
+  fw_require
+  say "Сначала открываю SSH (порт: $(ssh_ports)), чтобы не потерять доступ…"
+  fw_allow_ssh
+  case "$(fw_backend)" in
+    ufw)
+      run_as_root ufw default deny incoming >/dev/null
+      run_as_root ufw default allow outgoing >/dev/null
+      run_as_root ufw --force enable
+      ;;
+    firewalld)
+      run_as_root systemctl enable --now firewalld
+      fw_allow_ssh
+      fw_reload
+      say "Если Docker-контейнеры потеряли сеть — выполните: sudo systemctl restart docker"
+      ;;
+  esac
+  say "Фаервол включён."
+}
+
+fw_disable() {
+  fw_require
+  prompt_yes_no "Выключить фаервол? Правила сохранятся и применятся при включении." y || {
+    say "Отмена."
+    return 0
+  }
+  case "$(fw_backend)" in
+    ufw) run_as_root ufw --force disable ;;
+    firewalld) run_as_root systemctl disable --now firewalld ;;
+  esac
+  say "Фаервол выключен."
+}
+
+fw_show() {
+  fw_require
+  say "SSH-порт(ы): $(ssh_ports)"
+  case "$(fw_backend)" in
+    ufw)
+      if fw_active; then
+        run_as_root ufw status verbose
+      else
+        say "ufw выключен. Добавленные правила (применятся при включении):"
+        run_as_root ufw show added
+      fi
+      ;;
+    firewalld)
+      if fw_active; then
+        run_as_root firewall-cmd --list-all
+      else
+        say "firewalld выключен. Постоянная конфигурация:"
+        run_as_root firewall-offline-cmd --list-all 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
+fw_add_port_interactive() {
+  fw_require
+  local spec from
+  while true; do
+    spec="$(ask_value "Порт (например 8443 — tcp+udp, 8443/tcp, 20000:30000/udp)" "")"
+    fw_spec_valid "$spec" && break
+    warn "некорректный формат «$spec» (для диапазона нужен протокол: 20000:30000/udp)."
+  done
+  while true; do
+    from="$(ask_value "Открыть только для IP/подсети (Enter — для всех)" "")"
+    [[ -z "$from" ]] && break
+    valid_ip_or_cidr "$from" && break
+    warn "некорректный IP/подсеть «$from»."
+  done
+  fw_allow "$spec" "$from" "remnanode.sh"
+  fw_reload
+}
+
+fw_delete_interactive() {
+  fw_require
+  local items=() line i n choice sel args p is_ssh=0
+  local -a arr
+  case "$(fw_backend)" in
+    ufw)
+      while IFS= read -r line; do
+        [[ "$line" == ufw\ * ]] && items+=("${line#ufw }")
+      done < <(run_as_root env LC_ALL=C ufw show added 2>/dev/null || true)
+      ;;
+    firewalld)
+      for p in $(fwc --list-ports 2>/dev/null || true); do items+=("port $p"); done
+      for p in $(fwc --list-services 2>/dev/null || true); do items+=("service $p"); done
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && items+=("rich $line")
+      done < <(fwc --list-rich-rules 2>/dev/null || true)
+      ;;
+  esac
+  n=${#items[@]}
+  if ((n == 0)); then
+    say "Правил нет."
+    return 0
+  fi
+  i=1
+  for line in "${items[@]}"; do
+    printf ' %2d) %s\n' "$i" "$line"
+    i=$((i + 1))
+  done
+  choice="$(ask_value "Номер правила для удаления (Enter — отмена)" "")"
+  [[ -z "$choice" ]] && {
+    say "Отмена."
+    return 0
+  }
+  [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ] || die "Нет правила с номером $choice."
+  sel="${items[$((choice - 1))]}"
+
+  for p in $(ssh_ports); do
+    grep -qE "(^|[[:space:]=\"])${p}(/tcp)?([[:space:]\"]|$)" <<<"$sel" && is_ssh=1
+  done
+  if ((is_ssh)); then
+    prompt_yes_no "Похоже, это правило SSH — можно потерять доступ к серверу. Точно удалить?" n || {
+      say "Отмена."
+      return 0
+    }
+  fi
+
+  case "$(fw_backend)" in
+    ufw)
+      args="${sel%% comment *}"
+      read -r -a arr <<<"$args"
+      run_as_root ufw delete "${arr[@]}"
+      ;;
+    firewalld)
+      case "$sel" in
+        port\ *) fwc --remove-port="${sel#port }" >/dev/null ;;
+        service\ *) fwc --remove-service="${sel#service }" >/dev/null ;;
+        rich\ *) fwc --remove-rich-rule="${sel#rich }" >/dev/null ;;
+      esac
+      fw_reload
+      ;;
+  esac
+  say "Удалено: $sel"
+}
+
+fw_default_ports_list() {
+  local s out=""
+  for s in ${DEFAULT_FIREWALL_PORTS[@]+"${DEFAULT_FIREWALL_PORTS[@]}"}; do
+    out="$out $s"
+  done
+  trim "$out"
+}
+
+fw_open_defaults() {
+  fw_require
+  local s
+  say "Открываю SSH и порты по умолчанию: $(fw_default_ports_list)"
+  fw_allow_ssh
+  for s in ${DEFAULT_FIREWALL_PORTS[@]+"${DEFAULT_FIREWALL_PORTS[@]}"}; do
+    if fw_spec_valid "$s"; then
+      fw_allow "$s" "" "remnanode.sh default"
+    else
+      warn "пропуск некорректного значения в DEFAULT_FIREWALL_PORTS: «$s»"
+    fi
+  done
+  fw_reload
+}
+
+# --- IP панели (для ограничения NODE_PORT) ---
+panel_ip_file() { echo "$BASE_DIR/.remnanode_panel_ip"; }
+
+saved_panel_ip() {
+  if [[ -n "$PANEL_IP" ]]; then
+    echo "$PANEL_IP"
+    return
+  fi
+  local f
+  f="$(panel_ip_file)"
+  [[ -f "$f" ]] && trim "$(cat "$f")"
+  return 0
+}
+
+# stdout: IP панели или пусто (без ограничения).
+ask_panel_ip() {
+  if [[ -n "$PANEL_IP" ]]; then
+    echo "$PANEL_IP"
+    return
+  fi
+  local saved ip def
+  saved="$(saved_panel_ip)"
+  def="${saved:--}"
+  say "IP панели: NODE_PORT будет открыт только для него. «-» — открыть для всех."
+  while true; do
+    ip="$(ask_value "IP панели" "$def")"
+    if [[ "$ip" == "-" ]]; then
+      ip=""
+      break
+    fi
+    valid_ip_or_cidr "$ip" && break
+    warn "некорректный IP «$ip»."
+  done
+  mkdir -p "$BASE_DIR" 2>/dev/null || true
+  printf '%s\n' "${ip:--}" >"$(panel_ip_file)" 2>/dev/null || true
+  [[ "$ip" == "-" ]] && ip=""
+  echo "$ip"
+}
+
+fw_open_node_ports() {
+  fw_require
+  local ip kind port
+  ip="$(ask_panel_ip)"
+  say "Открываю SSH и порты нод…"
+  fw_allow_ssh
+  for kind in node hy2; do
+    kind_installed "$kind" || continue
+    port="$(kind_port "$kind")"
+    [[ -n "$port" ]] && fw_allow "$port/tcp" "$ip" "remnanode NODE_PORT $(kind_lr_name "$kind")"
+  done
+  if kind_installed hy2; then
+    fw_allow "80/tcp" "" "caddy ACME HTTP-01"
+  fi
+  fw_reload
+}
+
+# При установке ноды: SSH + NODE_PORT (+80 для hy2) + порты по умолчанию; предложить включить.
+fw_setup_on_install() {
+  local kind="$1" port="$2" old_port="${3:-}" ip s
+  say ""
+  say "=== Фаервол ==="
+  if [[ "$(fw_backend)" == "none" ]]; then
+    fw_install || {
+      warn "фаервол не установлен — пропуск."
+      return 0
+    }
+  fi
+  ip="$(ask_panel_ip)"
+  fw_allow_ssh
+  fw_allow "$port/tcp" "$ip" "remnanode NODE_PORT $(kind_lr_name "$kind")"
+  if [[ -n "$old_port" && "$old_port" != "$port" ]]; then
+    fw_delete_port_quiet "$old_port" "$ip"
+  fi
+  if [[ "$kind" == "hy2" ]]; then
+    fw_allow "80/tcp" "" "caddy ACME HTTP-01"
+  fi
+  if [[ "$FIREWALL_INSTALL_ADD_DEFAULT_PORTS" == "1" ]]; then
+    for s in ${DEFAULT_FIREWALL_PORTS[@]+"${DEFAULT_FIREWALL_PORTS[@]}"}; do
+      fw_spec_valid "$s" && fw_allow "$s" "" "remnanode.sh default"
+    done
+  fi
+  fw_reload
+  if ! fw_active; then
+    if prompt_yes_no "Фаервол сейчас выключен. Включить?" "$DEFAULT_ENABLE_FIREWALL_ON_INSTALL"; then
+      fw_enable
+    fi
+  fi
+  say "Порты inbound'ов из профиля Xray должны быть открыты: DEFAULT_FIREWALL_PORTS в начале скрипта или «Управление фаерволом → Открыть порт»."
+}
+
+fw_on_install() {
+  [[ "$FIREWALL_ON_INSTALL" == "1" ]] || return 0
+  is_linux || return 0
+  soft_step "настройка фаервола не завершена — проверьте в меню «Управление фаерволом»." fw_setup_on_install "$@"
+}
+
+# Смена NODE_PORT: открыть новый, закрыть старый (если фаервол есть).
+fw_node_port_changed() {
+  local kind="$1" old="$2" new="$3" ip okport
+  [[ "$FIREWALL_ON_INSTALL" == "1" ]] || return 0
+  is_linux || return 0
+  [[ "$(fw_backend)" != "none" ]] || return 0
+  ip="$(saved_panel_ip)"
+  [[ "$ip" == "-" ]] && ip=""
+  soft_step "не удалось открыть порт $new в фаерволе." fw_allow "$new/tcp" "$ip" "remnanode NODE_PORT $(kind_lr_name "$kind")"
+  okport="$(kind_port "$(other_kind "$kind")")"
+  if [[ -n "$old" && "$old" != "$okport" && " $(ssh_ports) " != *" $old "* ]]; then
+    fw_delete_port_quiet "$old" "$ip"
+    say "  закрыт старый порт: $old/tcp"
+  fi
+  soft_step "не удалось перезагрузить правила фаервола." fw_reload
+}
+
+# =============================================================================
 # Миграция старой раскладки обычной ноды
 # =============================================================================
 find_legacy_node_dir() {
@@ -1512,6 +2199,9 @@ install_node() {
   # Ротация логов на хосте; при сбое (нет sudo и т.д.) установка всё равно продолжается
   setup_logrotate_for_dir "$newdir" "$NODE_DIR_NAME" || true
 
+  ipv6_on_install
+  fw_on_install node "$port" "$own_port"
+
   dc "$newdir" config >/dev/null || die "docker compose config: проверьте синтаксис YAML."
   ensure_container_name_free "$NODE_CONTAINER" "$newdir"
 
@@ -1583,6 +2273,9 @@ install_hy2() {
   say "Записаны $dir/Caddyfile и $compose (режим сертификата: $(cert_mode_desc "$mode"))."
 
   setup_logrotate_for_dir "$dir" "$HY2_DIR_NAME" || true
+
+  ipv6_on_install
+  fw_on_install hy2 "$port" "$own_port"
 
   dc "$dir" config >/dev/null || die "docker compose config: проверьте синтаксис YAML."
   ensure_container_name_free "$CADDY_CONTAINER" "$dir"
@@ -1678,6 +2371,7 @@ action_change_token() {
   fi
   say "SECRET_KEY обновлён. Перезапуск ноды…"
   dc "$dir" up -d
+  [[ -n "$new_port" ]] && fw_node_port_changed "$kind" "$cur_port" "$new_port"
   post_start_check "$kind"
   [[ -n "$new_port" ]] && remind_panel_port "$new_port"
   say "Готово."
@@ -1702,6 +2396,7 @@ action_change_port() {
   compose_set_env NODE_PORT "$p" "$compose" || die "В $compose не найдена строка NODE_PORT."
   say "NODE_PORT: $cur → $p. Перезапуск ноды…"
   dc "$dir" up -d
+  fw_node_port_changed "$kind" "$cur" "$p"
   post_start_check "$kind"
   remind_panel_port "$p"
 }
@@ -1898,11 +2593,61 @@ menu_main() {
   while true; do
     menu_header "Remnawave Node — $SCRIPT_NAME  (каталог: $BASE_DIR)"
     echo " 1) Управление Remnawave Node"
+    echo " 2) Управление IPv6        [$(ipv6_status_line)]"
+    echo " 3) Управление фаерволом   [$(fw_status_line)]"
     echo " 0) Выход"
     read -r -p "Выберите пункт: " c || exit 0
     case "$(trim "$c")" in
       1) menu_nodes ;;
+      2) menu_ipv6 ;;
+      3) menu_firewall ;;
       0 | q) exit 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+menu_ipv6() {
+  local c
+  while true; do
+    menu_header "Управление IPv6  [$(ipv6_status_line)]"
+    echo " 1) Отключить IPv6"
+    echo " 2) Включить IPv6"
+    echo " 3) Статус и адреса"
+    echo " 0) Назад"
+    read -r -p "Выберите пункт: " c || exit 0
+    case "$(trim "$c")" in
+      1) run_action ipv6_disable ;;
+      2) run_action ipv6_enable ;;
+      3) run_action ipv6_show_status ;;
+      0 | q) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+menu_firewall() {
+  local c
+  while true; do
+    menu_header "Управление фаерволом  [$(fw_status_line)]"
+    echo " 1) Статус и список правил"
+    echo " 2) Включить"
+    echo " 3) Выключить"
+    echo " 4) Открыть порт"
+    echo " 5) Удалить правило"
+    echo " 6) Открыть порты по умолчанию (SSH + $(fw_default_ports_list))"
+    echo " 7) Открыть порты нод (SSH + NODE_PORT + 80 для Hysteria2)"
+    echo " 0) Назад"
+    read -r -p "Выберите пункт: " c || exit 0
+    case "$(trim "$c")" in
+      1) run_action fw_show ;;
+      2) run_action fw_enable ;;
+      3) run_action fw_disable ;;
+      4) run_action fw_add_port_interactive ;;
+      5) run_action fw_delete_interactive ;;
+      6) run_action fw_open_defaults ;;
+      7) run_action fw_open_node_ports ;;
+      0 | q) return 0 ;;
       *) ;;
     esac
   done
@@ -2071,6 +2816,32 @@ main() {
     hy2)
       shift
       cli_kind hy2 "$@"
+      ;;
+    ipv6)
+      case "${2:-status}" in
+        status) ipv6_show_status ;;
+        disable | off) ipv6_disable ;;
+        enable | on) ipv6_enable ;;
+        *) die "ipv6: status | disable | enable" ;;
+      esac
+      ;;
+    firewall | fw)
+      case "${2:-status}" in
+        status) fw_show ;;
+        enable | on) fw_enable ;;
+        disable | off) fw_disable ;;
+        allow | add)
+          [[ -n "${3:-}" ]] || die "Укажите порт: $SCRIPT_NAME firewall allow 8443/tcp [IP]"
+          fw_spec_valid "$3" || die "Некорректный порт: $3"
+          fw_require
+          fw_allow "$3" "${4:-}" "remnanode.sh"
+          fw_reload
+          ;;
+        delete | del | rm) fw_delete_interactive ;;
+        defaults) fw_open_defaults ;;
+        nodes) fw_open_node_ports ;;
+        *) die "firewall: status | enable | disable | allow <порт> [IP] | delete | defaults | nodes" ;;
+      esac
       ;;
     *)
       cli_kind node "$@"
