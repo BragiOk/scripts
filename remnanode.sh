@@ -67,7 +67,6 @@ DEFAULT_FIREWALL_PORTS=(
   "443/tcp"    # VLESS Reality / TLS
   "443/udp"    # Hysteria2
   "8443/tcp"
-  "6443/tcp"
   "55410/tcp"  
 )
 
