@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Доступ закрыт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rubik+Mono+One&family=Onest:wght@400;500;700&display=swap&subset=cyrillic" rel="stylesheet">
+<style>
+  :root {
+    --bg: #2A45D8;
+    --bg-line: rgba(255,255,255,.07);
+    --text: #FFFFFF;
+    --text-soft: rgba(255,255,255,.78);
+    --card: #F6F3EC;
+    --card-ink: #20232B;
+    --card-muted: #7A7D86;
+    --card-rule: #DAD5C8;
+    --stamp: #E0262F;
+    --accent: #FFD23F;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #172473;
+      --bg-line: rgba(255,255,255,.05);
+      --card: #ECE8DE;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #172473;
+    --bg-line: rgba(255,255,255,.05);
+    --card: #ECE8DE;
+  }
+  *, *::before, *::after { box-sizing: inherit; }
+  html { height: 100%; scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body {
+    margin: 0;
+    min-height: 100%;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--bg-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--bg-line) 1px, transparent 1px);
+    background-size: 48px 48px;
+    color: var(--text);
+    font-family: "Onest", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid;
+    place-items: center;
+    overflow-x: hidden;
+  }
+
+  .wrap {
+    width: min(1080px, 100%);
+    padding: clamp(24px, 5vw, 64px);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: clamp(40px, 6vw, 96px);
+    align-items: center;
+  }
+
+  /* ---------- Pass card ---------- */
+  .pass {
+    position: relative;
+    width: min(380px, 100%);
+    justify-self: center;
+    background: var(--card);
+    color: var(--card-ink);
+    border-radius: 20px;
+    padding: 28px 28px 24px;
+    transform: rotate(-3deg);
+    box-shadow: 0 30px 60px -20px rgba(0,0,0,.45);
+  }
+  .pass::before {
+    /* lanyard slot */
+    content: "";
+    position: absolute;
+    top: 14px;
+    left: 50%;
+    width: 56px;
+    height: 10px;
+    margin-left: -28px;
+    border-radius: 99px;
+    background: var(--bg);
+  }
+  .pass-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-top: 18px;
+    padding-bottom: 16px;
+    border-bottom: 2px dashed var(--card-rule);
+  }
+  .pass-title {
+    font-family: "Rubik Mono One", "Onest", sans-serif;
+    font-size: 1.35rem;
+  }
+  .pass-no { font-size: .85rem; color: var(--card-muted); }
+
+  .photo {
+    width: 84px;
+    height: 100px;
+    margin: 20px 0;
+    border-radius: 10px;
+    background: var(--card-rule);
+    display: grid;
+    place-items: center;
+  }
+  .photo svg { width: 46px; height: 46px; }
+
+  dl { margin: 0; display: grid; gap: 12px; }
+  dt { font-size: .78rem; color: var(--card-muted); margin-bottom: 2px; }
+  dd { margin: 0; font-weight: 700; font-size: 1.02rem; }
+
+  .barcode {
+    margin-top: 22px;
+    height: 44px;
+    background: repeating-linear-gradient(90deg,
+      var(--card-ink) 0 2px, transparent 2px 5px,
+      var(--card-ink) 5px 6px, transparent 6px 9px,
+      var(--card-ink) 9px 13px, transparent 13px 15px,
+      var(--card-ink) 15px 16px, transparent 16px 20px);
+    opacity: .85;
+  }
+
+  .stamp {
+    position: absolute;
+    right: -18px;
+    top: 46%;
+    padding: 10px 18px;
+    border: 4px solid var(--stamp);
+    border-radius: 10px;
+    color: var(--stamp);
+    font-family: "Rubik Mono One", "Onest", sans-serif;
+    font-size: 1.5rem;
+    line-height: 1.1;
+    text-align: center;
+    transform: rotate(14deg);
+    mix-blend-mode: multiply;
+    opacity: .92;
+    animation: stamp .45s cubic-bezier(.2,1.6,.4,1) .6s both;
+  }
+  .stamp small {
+    display: block;
+    font-family: "Onest", sans-serif;
+    font-weight: 700;
+    font-size: .7rem;
+    letter-spacing: .04em;
+  }
+  @keyframes stamp {
+    from { opacity: 0; transform: rotate(14deg) scale(2.2); }
+    to   { opacity: .92; transform: rotate(14deg) scale(1); }
+  }
+
+  /* ---------- Copy ---------- */
+  .copy { max-width: 32rem; }
+  h1 {
+    font-family: "Rubik Mono One", "Onest", sans-serif;
+    font-weight: 400;
+    font-size: clamp(1.9rem, 4.2vw, 3.1rem);
+    line-height: 1.12;
+    margin: 0 0 1.5rem;
+  }
+  .lead {
+    font-size: clamp(1.05rem, 1.4vw, 1.2rem);
+    line-height: 1.6;
+    color: var(--text-soft);
+    margin: 0 0 2.25rem;
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    font: 700 1rem/1 "Onest", system-ui, sans-serif;
+    text-decoration: none;
+    padding: 17px 26px;
+    border-radius: 99px;
+    border: 2px solid var(--accent);
+    transition: background-color .15s ease, color .15s ease;
+  }
+  .btn-primary { background: var(--accent); color: #1B1F2A; }
+  .btn-primary:hover { background: #FFE27A; border-color: #FFE27A; }
+  .btn-ghost { background: transparent; color: var(--text); border-color: rgba(255,255,255,.5); }
+  .btn-ghost:hover { border-color: var(--text); background: rgba(255,255,255,.08); }
+  .btn:focus-visible { outline: 3px solid var(--text); outline-offset: 3px; }
+
+  .hint {
+    margin: 2.25rem 0 0;
+    font-size: .92rem;
+    color: var(--text-soft);
+  }
+  .hint code {
+    font-family: inherit;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  @media (max-width: 800px) {
+    .wrap { grid-template-columns: 1fr; }
+    .pass { width: min(320px, 88%); }
+    .stamp { right: -8px; font-size: 1.25rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .stamp { animation: none; }
+    .btn { transition: none; }
+  }
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="pass" aria-hidden="true">
+      <div class="pass-head">
+        <span class="pass-title">ДОСТУП</span>
+        <span class="pass-no">Ошибка 403</span>
+      </div>
+      <div class="photo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#9A9DA6" stroke-width="1.6" stroke-linecap="round">
+          <circle cx="12" cy="8" r="4"/>
+          <path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/>
+        </svg>
+      </div>
+      <dl>
+        <div><dt>Пользователь</dt><dd>Гость</dd></div>
+        <div><dt>Раздел</dt><dd>Закрытый</dd></div>
+        <div><dt>Права доступа</dt><dd>Отсутствуют</dd></div>
+      </dl>
+      <div class="barcode"></div>
+      <div class="stamp">ДОСТУП<br>ЗАКРЫТ<small>Код 403</small></div>
+    </div>
+
+    <section class="copy">
+      <h1>У вас нет доступа к этому разделу</h1>
+      <p class="lead">Этот раздел доступен только пользователям с нужными правами. Запросите доступ у администратора или вернитесь на главную страницу.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="mailto:admin@example.com?subject=%D0%9D%D1%83%D0%B6%D0%B5%D0%BD%20%D0%B4%D0%BE%D1%81%D1%82%D1%83%D0%BF">Запросить доступ</a>
+        <a class="btn btn-ghost" href="/">На главную</a>
+      </div>
+      <p class="hint">При обращении к администратору укажите код ошибки <code>403</code>.</p>
+    </section>
+  </main>
+</body>
+</html>
