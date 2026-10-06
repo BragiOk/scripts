@@ -1,11 +1,202 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Доступ закрыт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Manrope:wght@400;500;600&display=swap&subset=cyrillic" rel="stylesheet">
+<style>
+  :root {
+    --bg: #DCE0E6;
+    --door: #C9CED7;
+    --door-edge: #B7BDC8;
+    --ink: #1F2633;
+    --muted: #586174;
+    --glow: #FFB648;
+    --glow-deep: #E8742A;
+    --btn-bg: #1F2633;
+    --btn-ink: #F2F4F7;
+    --focus: #E8742A;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151A24;
+      --door: #1D2330;
+      --door-edge: #2A3243;
+      --ink: #E9ECF2;
+      --muted: #98A1B3;
+      --btn-bg: #E9ECF2;
+      --btn-ink: #151A24;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #151A24;
+    --door: #1D2330;
+    --door-edge: #2A3243;
+    --ink: #E9ECF2;
+    --muted: #98A1B3;
+    --btn-bg: #E9ECF2;
+    --btn-ink: #151A24;
+  }
+  *, *::before, *::after { box-sizing: inherit; }
+  html { height: 100%; scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Manrope", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid;
+    place-items: center;
+    overflow-x: hidden;
+  }
+
+  .stage {
+    width: min(1040px, 100%);
+    padding: clamp(24px, 5vw, 64px);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: clamp(32px, 6vw, 88px);
+    align-items: center;
+  }
+
+  /* Door with a keyhole of light */
+  .door {
+    position: relative;
+    aspect-ratio: 3 / 4.4;
+    max-height: 78vh;
+    width: 100%;
+    justify-self: center;
+    background: var(--door);
+    border-radius: 999px 999px 18px 18px;
+    box-shadow:
+      inset 0 0 0 1px var(--door-edge),
+      inset 0 -40px 80px -40px rgba(0,0,0,.12);
+    overflow: hidden;
+  }
+  .door::before {
+    /* inner panel line */
+    content: "";
+    position: absolute;
+    inset: 7%;
+    border-radius: 999px 999px 10px 10px;
+    border: 1px solid var(--door-edge);
+  }
+  .keyhole {
+    position: absolute;
+    left: 50%;
+    top: 58%;
+    width: 22%;
+    transform: translate(-50%, -50%);
+    filter: drop-shadow(0 0 22px var(--glow)) drop-shadow(0 0 60px var(--glow-deep));
+    animation: kindle 1.8s ease-out both;
+  }
+  .keyhole svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .spill {
+    position: absolute;
+    left: 50%;
+    top: 58%;
+    width: 160%;
+    aspect-ratio: 1;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(circle, rgba(255,182,72,.28) 0%, rgba(255,182,72,0) 45%);
+    pointer-events: none;
+    animation: kindle 2.4s ease-out both;
+  }
+  @keyframes kindle {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .copy { max-width: 34rem; }
+  .code {
+    font-family: "Unbounded", "Manrope", system-ui, sans-serif;
+    font-weight: 500;
+    font-size: 1rem;
+    color: var(--muted);
+    margin: 0 0 1.25rem;
+    letter-spacing: .02em;
+  }
+  h1 {
+    font-family: "Unbounded", "Manrope", system-ui, sans-serif;
+    font-weight: 700;
+    font-size: clamp(2rem, 4.6vw, 3.4rem);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    margin: 0 0 1.5rem;
+  }
+  .lead {
+    font-size: clamp(1.05rem, 1.4vw, 1.2rem);
+    line-height: 1.6;
+    color: var(--muted);
+    margin: 0 0 2.25rem;
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    font: 600 1rem/1 "Manrope", system-ui, sans-serif;
+    text-decoration: none;
+    padding: 16px 24px;
+    border-radius: 12px;
+    border: 1.5px solid var(--btn-bg);
+    transition: transform .15s ease, background-color .15s ease, color .15s ease;
+  }
+  .btn-primary { background: var(--btn-bg); color: var(--btn-ink); }
+  .btn-ghost { background: transparent; color: var(--ink); }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-ghost:hover { background: var(--btn-bg); color: var(--btn-ink); }
+  .btn:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+
+  .note {
+    margin: 2.5rem 0 0;
+    font-size: .9rem;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+
+  @media (max-width: 760px) {
+    .stage { grid-template-columns: 1fr; text-align: left; }
+    .door { width: min(260px, 70%); max-height: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .keyhole, .spill { animation: none; }
+    .btn { transition: none; }
+    .btn:hover { transform: none; }
+  }
+</style>
 </head>
 <body>
-    
+  <main class="stage">
+    <div class="door" aria-hidden="true">
+      <div class="spill"></div>
+      <div class="keyhole">
+        <svg viewBox="0 0 60 110" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <radialGradient id="light" cx="50%" cy="30%" r="80%">
+              <stop offset="0%" stop-color="#FFF4D6"/>
+              <stop offset="45%" stop-color="#FFB648"/>
+              <stop offset="100%" stop-color="#E8742A"/>
+            </radialGradient>
+          </defs>
+          <path d="M30 0a26 26 0 0 1 13.5 48.2L54 110H6l10.5-61.8A26 26 0 0 1 30 0z" fill="url(#light)"/>
+        </svg>
+      </div>
+    </div>
+
+    <section class="copy">
+      <p class="code">Ошибка 403</p>
+      <h1>Эта дверь для вас пока закрыта</h1>
+      <p class="lead">У вашей учётной записи нет прав на просмотр этой страницы. Если вы считаете, что доступ должен быть, запросите его у администратора или войдите под другим аккаунтом.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="/">Вернуться на главную</a>
+        <a class="btn btn-ghost" href="mailto:admin@example.com?subject=%D0%97%D0%B0%D0%BF%D1%80%D0%BE%D1%81%20%D0%B4%D0%BE%D1%81%D1%82%D1%83%D0%BF%D0%B0">Запросить доступ</a>
+      </div>
+      <p class="note">Вошли не в тот аккаунт? Выйдите и авторизуйтесь заново.</p>
+    </section>
+  </main>
 </body>
 </html>
