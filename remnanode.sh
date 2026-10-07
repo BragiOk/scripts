@@ -5181,6 +5181,10 @@ cli_caddy() {
 main() {
   compute_base_dir
   local cmd="${1:-menu}"
+  # Сразу переносим скрипт в каталог remnanode/ (если запущен из файла, а не через bash <(curl ...))
+  if [[ "$cmd" != "-h" && "$cmd" != "--help" && "$cmd" != "help" && -f "$SCRIPT_PATH" ]]; then
+    relocate_script_to_base
+  fi
   case "$cmd" in
     -h | --help | help)
       usage
