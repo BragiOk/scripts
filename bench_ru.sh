@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+
+# ======================= Настройки для России ==========================
+# Значения можно менять здесь или задавать при запуске: RU_SERVERS=3 EU_SERVERS=0 bash bench_ru.sh
+RU_SERVERS="${RU_SERVERS:-3}"   # российских
+EU_SERVERS="${EU_SERVERS:-4}"   # европейских (0 — не тестировать Европу)
+# Страна: пусто — определять автоматически, "RU" — всегда российский режим
+BENCH_COUNTRY="${BENCH_COUNTRY:-}"
+# =======================================================================
 #
 # Description: Auto test download & I/O speed & network speed script
 #
@@ -247,7 +255,12 @@ speed_ru() {
     fi
 
     # Россия (github.com/itdoginfo/russian-iperf3-servers)
-    pick_and_test 5 75 \
+    [[ "${RU_SERVERS}" =~ ^[0-9]+$ ]] || RU_SERVERS=5
+    [[ "${EU_SERVERS}" =~ ^[0-9]+$ ]] || EU_SERVERS=2
+
+    # Россия (github.com/itdoginfo/russian-iperf3-servers); ~15 с на сервер
+    if (( RU_SERVERS > 0 )); then
+    pick_and_test "${RU_SERVERS}" $(( RU_SERVERS * 15 )) \
         "Moscow, RU|spd-rudp.hostkey.ru|5202-5209" \
         "Moscow, RU|mskst.st.mtsws.net|3333" \
         "St.Petersburg, RU|st.spb.ertelecom.ru|5201-5209" \
@@ -268,14 +281,17 @@ speed_ru() {
         "Yekaterinburg, RU|st.ekat.ertelecom.ru|5201-5209" \
         "Novosibirsk, RU|st.nsk.ertelecom.ru|5201-5209"
     [[ "$(cat ./iperf_count.txt 2>/dev/null)" == "0" ]] && _red " Российские серверы сейчас недоступны или заняты\n"
+    fi
 
-    # Европа: если доступна — 2 лучших сервера, иначе тихо пропускаем
-    pick_and_test 2 30 \
+    # Европа: если доступна — EU_SERVERS лучших серверов, иначе тихо пропускаем
+    if (( EU_SERVERS > 0 )); then
+    pick_and_test "${EU_SERVERS}" $(( EU_SERVERS * 15 )) \
         "Amsterdam, NL|iperf-ams-nl.eranium.net|5201-5210" \
         "London, UK|lon.speedtest.clouvider.net|5200-5209" \
         "Paris, FR|ping.online.net|5200-5209" \
         "Frankfurt, DE|speedtest.fra1.de.leaseweb.net|5201-5210"
     [[ "$(cat ./iperf_count.txt 2>/dev/null)" == "0" ]] && printf "\033[0;33m%-20s\033[0;31m%s\033[0m\n" " Europe" "Unavailable"
+    fi
 
     rm -f ./iperf_count.txt ./iperf_up.json ./iperf_dl.json
     return 0
@@ -732,7 +748,7 @@ next
 print_io_test
 next
 if [[ "${SERVER_COUNTRY}" == "RU" ]]; then
-    echo " Speed test mode    : $(_yellow "Russia (iperf3: top-5 RU + Europe)")"
+    echo " Speed test mode    : $(_yellow "Russia (iperf3: ${RU_SERVERS} RU + ${EU_SERVERS} EU)")"
     printf "%-20s%-18s%-20s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency"
     speed
     cleanup
