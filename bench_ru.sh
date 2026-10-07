@@ -45,7 +45,7 @@ next() {
 }
 
 cleanup() {
-    rm -fr speedtest.tgz speedtest-cli benchtest_* iperf_up.json iperf_dl.json iperf_probe.txt 2>/dev/null
+    rm -fr speedtest.tgz speedtest-cli benchtest_* iperf_up.json iperf_dl.json iperf_probe.txt iperf_count.txt 2>/dev/null
 }
 
 get_opsy() {
@@ -154,127 +154,130 @@ install_iperf3() {
     _exists "iperf3"
 }
 
-# Вытащить скорость (Мбит/с) из JSON iperf3: значение bits_per_second в блоке sum_received
+# Вытащить скорость (Мбит/с) из JSON iperf3: bits_per_second в блоке sum_received
 iperf_mbps() {
     awk -F':' '/"sum_received"/{f=1} f && /"bits_per_second"/{gsub(/[^0-9.eE+-]/,"",$2); printf "%.2f", $2/1000000; exit}' "${1}"
 }
 
-# Средний RTT из JSON iperf3 (мкс -> мс), если ping запрещён
-iperf_rtt() {
-    awk -F':' '/"mean_rtt"/{gsub(/[^0-9.]/,"",$2); if ($2>0) {printf "%.2f", $2/1000; exit}}' "${1}"
+# "5200-5209" -> "5200 5201 ... 5209" в случайном порядке, не больше 4 портов
+expand_ports() {
+    local spec="${1}"
+    if [[ "${spec}" == *-* ]]; then
+        seq "${spec%-*}" "${spec#*-}" | shuf 2>/dev/null | head -n 4 | tr '\n' ' '
+    else
+        echo "${spec}"
+    fi
 }
 
-# iperf_test "хост" "порты через пробел" "Подпись"
+# Быстрая проверка: TCP-подключение, в ответ — время в микросекундах
+tcp_probe() {
+    local host="${1}" port="${2}" t0 t1
+    t0=$(date +%s%N)
+    timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null || return 1
+    t1=$(date +%s%N)
+    echo "$(( (t1 - t0) / 1000 ))"
+}
+
+RU_ROW_FMT="\033[0;33m%-20s\033[0;32m%-18s\033[0;31m%-20s\033[0;36m%-12s\033[0m\n"
+
+# iperf_test "хост" "порты" "Подпись" — 1 с проверка, затем короткий полноценный тест
 iperf_test() {
     local host="${1}" ports="${2}" nodeName="${3}"
     local up_log="./iperf_up.json" dl_log="./iperf_dl.json"
-    local port up dl lat ok=0
+    local port good="" up dl lat
 
     for port in ${ports}; do
-        if timeout 25 iperf3 -c "${host}" -p "${port}" -P 8 -t 10 -J --connect-timeout 3000 >"${up_log}" 2>/dev/null \
-            && grep -q '"sum_received"' "${up_log}"; then
-            sleep 1
-            if timeout 25 iperf3 -c "${host}" -p "${port}" -P 8 -t 10 -R -J --connect-timeout 3000 >"${dl_log}" 2>/dev/null \
-                && grep -q '"sum_received"' "${dl_log}"; then
-                ok=1
-                break
-            fi
+        if timeout 5 iperf3 -c "${host}" -p "${port}" -t 1 --connect-timeout 2000 2>/dev/null | grep -q receiver; then
+            good="${port}"
+            break
         fi
     done
+    [[ -z "${good}" ]] && return 1
 
-    if [[ ${ok} -ne 1 ]]; then
-        rm -f "${up_log}" "${dl_log}"
-        return 1
-    fi
-
+    timeout 10 iperf3 -c "${host}" -p "${good}" -P 8 -t 4 -O 1 -J --connect-timeout 2000 >"${up_log}" 2>/dev/null
+    timeout 10 iperf3 -c "${host}" -p "${good}" -P 8 -t 4 -O 1 -R -J --connect-timeout 2000 >"${dl_log}" 2>/dev/null
     up="$(iperf_mbps "${up_log}")"
     dl="$(iperf_mbps "${dl_log}")"
-    lat="$(ping -c 4 -W 2 "${host}" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.2f", $5}')"
-    [[ -z "${lat}" ]] && lat="$(iperf_rtt "${up_log}")"
-    [[ -z "${lat}" ]] && lat="N/A" || lat="${lat} ms"
     rm -f "${up_log}" "${dl_log}"
+    [[ -z "${up}" || -z "${dl}" ]] && return 1
 
-    printf "\033[0;33m%-18s\033[0;32m%-18s\033[0;31m%-20s\033[0;36m%-12s\033[0m\n" " ${nodeName}" "${up} Mbps" "${dl} Mbps" "${lat}"
+    lat="$(ping -c 3 -i 0.2 -W 1 "${host}" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.2f ms", $5}')"
+    [[ -z "${lat}" ]] && lat="${PROBE_LAT}"
+
+    printf "${RU_ROW_FMT}" " ${nodeName}" "${up} Mbps" "${dl} Mbps" "${lat}"
     return 0
 }
 
-# Время TCP-подключения к iperf3-серверу в мс (заодно проверка, что порт открыт)
-tcp_probe() {
-    local host="${1}" ports="${2}" p t0 t1 n=0
-    for p in ${ports}; do
-        n=$((n + 1)); [[ ${n} -gt 3 ]] && break
-        t0=$(date +%s%N)
-        if timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${p}" 2>/dev/null; then
-            t1=$(date +%s%N)
-            echo "$(( (t1 - t0) / 1000 ))"   # микросекунды
-            return 0
-        fi
+# pick_and_test <сколько> <лимит секунд> "Город|хост|порты" ...
+# Параллельно пингует все, сортирует по задержке, тестирует лучшие (по одному на город)
+pick_and_test() {
+    local want="${1}" budget="${2}"; shift 2
+    local pool=("$@") tmp="./iperf_probe.txt" i
+    : >"${tmp}"
+    for i in "${!pool[@]}"; do
+        (
+            IFS='|' read -r _c _h _p <<<"${pool[$i]}"
+            for _port in $(expand_ports "${_p}"); do
+                r="$(tcp_probe "${_h}" "${_port}")" && { echo "${r}|${i}" >>"${tmp}"; break; }
+            done
+        ) &
     done
-    return 1
+    wait
+
+    local start=${SECONDS} ok=0 done_c="|" us idx city host ports
+    while IFS='|' read -r us idx; do
+        (( SECONDS - start >= budget )) && break
+        IFS='|' read -r city host ports <<<"${pool[$idx]}"
+        [[ "${done_c}" == *"|${city}|"* ]] && continue
+        PROBE_LAT="$(awk -v u="${us}" 'BEGIN{printf "%.2f ms", u/1000}')"
+        if iperf_test "${host}" "$(expand_ports "${ports}")" "${city}"; then
+            done_c+="${city}|"
+            ok=$((ok + 1))
+            (( ok >= want )) && break
+        fi
+    done < <(sort -t'|' -k1,1n "${tmp}" 2>/dev/null)
+    rm -f "${tmp}"
+    echo "${ok}" >./iperf_count.txt
 }
 
 speed_ru() {
-    local P="5201 5202 5203 5204 5205 5206 5207 5208 5209"
-    # Город | хост | порты  (источник: github.com/itdoginfo/russian-iperf3-servers)
-    local pool=(
-        "Moscow, RU|spd-rudp.hostkey.ru|${P}"
-        "Moscow, RU|mskst.st.mtsws.net|3333"
-        "St.Petersburg, RU|st.spb.ertelecom.ru|${P}"
-        "Tver, RU|st.tver.ertelecom.ru|${P}"
-        "Yaroslavl, RU|st.yar.ertelecom.ru|${P}"
-        "Tula, RU|st.tula.ertelecom.ru|${P}"
-        "Ryazan, RU|st.ryazan.ertelecom.ru|${P}"
-        "Vladimir, RU|speed-vld.vtt.net|5201"
-        "N.Novgorod, RU|st.nn.ertelecom.ru|5202 5203 5204 5205 5206"
-        "N.Novgorod, RU|speed-nn.vtt.net|5201"
-        "Voronezh, RU|voronezh-speedtest.corbina.net|5201"
-        "Voronezh, RU|st.voronezh.ertelecom.ru|${P}"
-        "Kazan, RU|kazst.st.mtsws.net|3333"
-        "Kazan, RU|st.kzn.ertelecom.ru|5202 5203 5204 5205 5206"
-        "Krasnodar, RU|kndst.st.mtsws.net|3333"
-        "Rostov, RU|st.rostov.ertelecom.ru|${P}"
-        "Samara, RU|st.samara.ertelecom.ru|${P}"
-        "Yekaterinburg, RU|st.ekat.ertelecom.ru|${P}"
-        "Novosibirsk, RU|st.nsk.ertelecom.ru|${P}"
-    )
-    local want=5
-
     if ! install_iperf3; then
         _red " Не удалось установить iperf3 (apt install iperf3)\n"
         return 0
     fi
 
-    # 1) Параллельно проверяем доступность и задержку всех серверов
-    local tmp="./iperf_probe.txt" i
-    : >"${tmp}"
-    for i in "${!pool[@]}"; do
-        (
-            IFS='|' read -r _c _h _p <<<"${pool[$i]}"
-            r="$(tcp_probe "${_h}" "${_p}")" && echo "${r}|${i}" >>"${tmp}"
-        ) &
-    done
-    wait
+    # Россия (github.com/itdoginfo/russian-iperf3-servers)
+    pick_and_test 5 75 \
+        "Moscow, RU|spd-rudp.hostkey.ru|5202-5209" \
+        "Moscow, RU|mskst.st.mtsws.net|3333" \
+        "St.Petersburg, RU|st.spb.ertelecom.ru|5201-5209" \
+        "Tver, RU|st.tver.ertelecom.ru|5201-5209" \
+        "Yaroslavl, RU|st.yar.ertelecom.ru|5201-5209" \
+        "Tula, RU|st.tula.ertelecom.ru|5201-5209" \
+        "Ryazan, RU|st.ryazan.ertelecom.ru|5201-5209" \
+        "Vladimir, RU|speed-vld.vtt.net|5201" \
+        "N.Novgorod, RU|st.nn.ertelecom.ru|5202-5209" \
+        "N.Novgorod, RU|speed-nn.vtt.net|5201" \
+        "Voronezh, RU|voronezh-speedtest.corbina.net|5201" \
+        "Voronezh, RU|st.voronezh.ertelecom.ru|5201-5209" \
+        "Kazan, RU|kazst.st.mtsws.net|3333" \
+        "Kazan, RU|st.kzn.ertelecom.ru|5202-5209" \
+        "Krasnodar, RU|kndst.st.mtsws.net|3333" \
+        "Rostov, RU|st.rostov.ertelecom.ru|5201-5209" \
+        "Samara, RU|st.samara.ertelecom.ru|5201-5209" \
+        "Yekaterinburg, RU|st.ekat.ertelecom.ru|5201-5209" \
+        "Novosibirsk, RU|st.nsk.ertelecom.ru|5201-5209"
+    [[ "$(cat ./iperf_count.txt 2>/dev/null)" == "0" ]] && _red " Российские серверы сейчас недоступны или заняты\n"
 
-    if [[ ! -s "${tmp}" ]]; then
-        _red " Российские iperf3-серверы недоступны с этого хоста\n"
-        rm -f "${tmp}"
-        return 0
-    fi
+    # Европа: если доступна — 2 лучших сервера, иначе тихо пропускаем
+    pick_and_test 2 30 \
+        "Amsterdam, NL|iperf-ams-nl.eranium.net|5201-5210" \
+        "London, UK|lon.speedtest.clouvider.net|5200-5209" \
+        "Paris, FR|ping.online.net|5200-5209" \
+        "Frankfurt, DE|speedtest.fra1.de.leaseweb.net|5201-5210"
+    [[ "$(cat ./iperf_count.txt 2>/dev/null)" == "0" ]] && printf "\033[0;33m%-20s\033[0;31m%s\033[0m\n" " Europe" "Unavailable"
 
-    # 2) Берём самые быстрые по задержке, по одному на город, пока не наберём 5 успешных
-    local done_cities="|" ok=0 idx city host ports
-    while IFS='|' read -r _ idx; do
-        IFS='|' read -r city host ports <<<"${pool[$idx]}"
-        [[ "${done_cities}" == *"|${city}|"* ]] && continue
-        if iperf_test "${host}" "${ports}" "${city}"; then
-            done_cities+="${city}|"
-            ok=$((ok + 1))
-            [[ ${ok} -ge ${want} ]] && break
-        fi
-    done < <(sort -t'|' -k1,1n "${tmp}")
-
-    rm -f "${tmp}" ./iperf_up.json ./iperf_dl.json
-    [[ ${ok} -eq 0 ]] && _red " Все iperf3-серверы заняты, попробуйте позже\n"
+    rm -f ./iperf_count.txt ./iperf_up.json ./iperf_dl.json
     return 0
 }
 
@@ -729,8 +732,8 @@ next
 print_io_test
 next
 if [[ "${SERVER_COUNTRY}" == "RU" ]]; then
-    echo " Speed test mode    : $(_yellow "Russia (iperf3, top-5 by latency)")"
-    print_speed_header
+    echo " Speed test mode    : $(_yellow "Russia (iperf3: top-5 RU + Europe)")"
+    printf "%-20s%-18s%-20s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency"
     speed
     cleanup
 else
