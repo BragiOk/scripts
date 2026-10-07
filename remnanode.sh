@@ -122,6 +122,9 @@ LOGROTATE_ROTATE=5
 # 1 — gzip для архивов; 0 — только переименование без сжатия
 LOGROTATE_COMPRESS=1
 
+# Тест скорости сервера (bench.sh с российскими серверами)
+BENCH_URL="https://raw.githubusercontent.com/BragiOk/scripts/refs/heads/main/bench_ru.sh"
+
 # =============================================================================
 # Внутренние переменные (менять не нужно)
 # =============================================================================
@@ -227,6 +230,7 @@ IPv6:
   firewall defaults           открыть SSH + DEFAULT_FIREWALL_PORTS
   firewall nodes              открыть SSH + NODE_PORT обеих нод + порты Caddy (80/443)
 
+  bench            тест скорости сервера (bench.sh с российскими серверами)
   help             эта справка
 
 Каталоги:
@@ -4792,6 +4796,27 @@ kind_status_line() {
   echo "${st} · порт ${port:-?}${extra}"
 }
 
+# Тест скорости: скачать bench_ru.sh (wget или curl) и запустить
+action_speedtest() {
+  local tmp url
+  url="${BENCH_URL}?$(date +%s)"   # ?время — чтобы GitHub не отдал старую копию из кэша
+  tmp="$(mktemp)"
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp" "$url" || true
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$tmp" || true
+  else
+    rm -f "$tmp"
+    die "Не найден ни wget, ни curl"
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    die "Не удалось скачать скрипт теста скорости: $BENCH_URL"
+  fi
+  run_as_root bash "$tmp" || true
+  rm -f "$tmp"
+}
+
 menu_header() {
   echo
   echo "================================================================"
@@ -4807,6 +4832,7 @@ menu_main() {
     echo " 2) Caddy (сертификаты)    [$(caddy_status_line)]"
     echo " 3) Управление IPv6        [$(ipv6_status_line)]"
     echo " 4) Управление фаерволом   [$(fw_status_line)]"
+    echo " 5) Тест скорости сервера"
     echo " 0) Выход"
     read -r -p "Выберите пункт: " c || exit 0
     case "$(trim "$c")" in
@@ -4814,6 +4840,7 @@ menu_main() {
       2) menu_caddy ;;
       3) menu_ipv6 ;;
       4) menu_firewall ;;
+      5) run_action action_speedtest ;;
       0 | q) exit 0 ;;
       *) ;;
     esac
@@ -5172,6 +5199,9 @@ main() {
       ;;
     migrate)
       cmd_migrate
+      ;;
+    bench | speedtest)
+      action_speedtest
       ;;
     ipv6)
       case "${2:-status}" in
