@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 #
 # Description: Auto test download & I/O speed & network speed script
@@ -46,7 +45,7 @@ next() {
 }
 
 cleanup() {
-    rm -fr speedtest.tgz speedtest-cli benchtest_* 2>/dev/null
+    rm -fr speedtest.tgz speedtest-cli benchtest_* iperf_up.json iperf_dl.json iperf_probe.txt 2>/dev/null
 }
 
 get_opsy() {
@@ -113,9 +112,16 @@ speed_test() {
     fi
 }
 
-# ---------- Определение страны сервера ----------
+# ======================================================================
+#  Добавлено для серверов в России
+#  Speedtest.net (Ookla) в РФ часто недоступен, поэтому для RU скорость
+#  дополнительно меряется через iperf3 до российских серверов
+#  (список: github.com/itdoginfo/russian-iperf3-servers).
+#  Вывод — та же таблица: Upload / Download / Latency.
+# ======================================================================
+
 detect_country() {
-    # Можно принудительно задать: BENCH_COUNTRY=RU bash bench_ru.sh
+    # Принудительно: BENCH_COUNTRY=RU
     if [[ -n "${BENCH_COUNTRY}" ]]; then
         SERVER_COUNTRY="$(echo "${BENCH_COUNTRY}" | tr '[:lower:]' '[:upper:]')"
         return
@@ -129,54 +135,147 @@ detect_country() {
     fi
 }
 
-# Найти ID российского сервера Ookla по названию города через API speedtest.net
-find_ru_server_id() {
-    local query="${1}"
-    ${ip_check_cmd} "https://www.speedtest.net/api/js/servers?engine=js&https_functional=true&limit=20&search=${query}" 2>/dev/null \
-        | tr '}' '\n' \
-        | grep '"cc":"RU"' \
-        | grep -o '"id":"\?[0-9]\+' \
-        | head -n 1 \
-        | grep -o '[0-9]\+$'
+print_speed_header() {
+    printf "%-18s%-18s%-20s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency"
 }
 
-speed_ru() {
-    speed_test '' 'Speedtest.net'
+install_iperf3() {
+    _exists "iperf3" && return 0
+    if _exists "apt-get"; then
+        DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get -qq -y install iperf3 >/dev/null 2>&1
+    elif _exists "dnf"; then
+        dnf -q -y install iperf3 >/dev/null 2>&1
+    elif _exists "yum"; then
+        yum -q -y install iperf3 >/dev/null 2>&1
+    elif _exists "apk"; then
+        apk add -q iperf3 >/dev/null 2>&1
+    fi
+    _exists "iperf3"
+}
 
-    # Город для поиска | Подпись в таблице
-    local cities=(
-        "Moscow|Moscow, RU"
-        "Petersburg|St.Petersburg, RU"
-        "Kazan|Kazan, RU"
-        "Yekaterinburg|Yekaterinburg, RU"
-        "Novosibirsk|Novosibirsk, RU"
-        "Krasnodar|Krasnodar, RU"
-        "Vladivostok|Vladivostok, RU"
-    )
-    local found=0 item query label id
-    for item in "${cities[@]}"; do
-        query="${item%%|*}"
-        label="${item##*|}"
-        id="$(find_ru_server_id "${query}")"
-        if [[ -n "${id}" ]]; then
-            speed_test "${id}" "${label}"
-            found=$((found + 1))
+# Вытащить скорость (Мбит/с) из JSON iperf3: значение bits_per_second в блоке sum_received
+iperf_mbps() {
+    awk -F':' '/"sum_received"/{f=1} f && /"bits_per_second"/{gsub(/[^0-9.eE+-]/,"",$2); printf "%.2f", $2/1000000; exit}' "${1}"
+}
+
+# Средний RTT из JSON iperf3 (мкс -> мс), если ping запрещён
+iperf_rtt() {
+    awk -F':' '/"mean_rtt"/{gsub(/[^0-9.]/,"",$2); if ($2>0) {printf "%.2f", $2/1000; exit}}' "${1}"
+}
+
+# iperf_test "хост" "порты через пробел" "Подпись"
+iperf_test() {
+    local host="${1}" ports="${2}" nodeName="${3}"
+    local up_log="./iperf_up.json" dl_log="./iperf_dl.json"
+    local port up dl lat ok=0
+
+    for port in ${ports}; do
+        if timeout 25 iperf3 -c "${host}" -p "${port}" -P 8 -t 10 -J --connect-timeout 3000 >"${up_log}" 2>/dev/null \
+            && grep -q '"sum_received"' "${up_log}"; then
+            sleep 1
+            if timeout 25 iperf3 -c "${host}" -p "${port}" -P 8 -t 10 -R -J --connect-timeout 3000 >"${dl_log}" 2>/dev/null \
+                && grep -q '"sum_received"' "${dl_log}"; then
+                ok=1
+                break
+            fi
         fi
     done
 
-    # Запасной вариант: API недоступен — берём ближайшие российские серверы из списка speedtest-cli
-    if [[ ${found} -eq 0 ]]; then
-        local ids
-        ids="$(./speedtest-cli/speedtest -L --accept-license --accept-gdpr 2>/dev/null \
-            | awk '/Russia/ && $1 ~ /^[0-9]+$/ {print $1}' | head -n 5)"
-        if [[ -z "${ids}" ]]; then
-            _red " Не удалось найти российские серверы Speedtest\n"
+    if [[ ${ok} -ne 1 ]]; then
+        rm -f "${up_log}" "${dl_log}"
+        return 1
+    fi
+
+    up="$(iperf_mbps "${up_log}")"
+    dl="$(iperf_mbps "${dl_log}")"
+    lat="$(ping -c 4 -W 2 "${host}" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.2f", $5}')"
+    [[ -z "${lat}" ]] && lat="$(iperf_rtt "${up_log}")"
+    [[ -z "${lat}" ]] && lat="N/A" || lat="${lat} ms"
+    rm -f "${up_log}" "${dl_log}"
+
+    printf "\033[0;33m%-18s\033[0;32m%-18s\033[0;31m%-20s\033[0;36m%-12s\033[0m\n" " ${nodeName}" "${up} Mbps" "${dl} Mbps" "${lat}"
+    return 0
+}
+
+# Время TCP-подключения к iperf3-серверу в мс (заодно проверка, что порт открыт)
+tcp_probe() {
+    local host="${1}" ports="${2}" p t0 t1 n=0
+    for p in ${ports}; do
+        n=$((n + 1)); [[ ${n} -gt 3 ]] && break
+        t0=$(date +%s%N)
+        if timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${p}" 2>/dev/null; then
+            t1=$(date +%s%N)
+            echo "$(( (t1 - t0) / 1000 ))"   # микросекунды
             return 0
         fi
-        for id in ${ids}; do
-            speed_test "${id}" "RU #${id}"
-        done
+    done
+    return 1
+}
+
+speed_ru() {
+    local P="5201 5202 5203 5204 5205 5206 5207 5208 5209"
+    # Город | хост | порты  (источник: github.com/itdoginfo/russian-iperf3-servers)
+    local pool=(
+        "Moscow, RU|spd-rudp.hostkey.ru|${P}"
+        "Moscow, RU|mskst.st.mtsws.net|3333"
+        "St.Petersburg, RU|st.spb.ertelecom.ru|${P}"
+        "Tver, RU|st.tver.ertelecom.ru|${P}"
+        "Yaroslavl, RU|st.yar.ertelecom.ru|${P}"
+        "Tula, RU|st.tula.ertelecom.ru|${P}"
+        "Ryazan, RU|st.ryazan.ertelecom.ru|${P}"
+        "Vladimir, RU|speed-vld.vtt.net|5201"
+        "N.Novgorod, RU|st.nn.ertelecom.ru|5202 5203 5204 5205 5206"
+        "N.Novgorod, RU|speed-nn.vtt.net|5201"
+        "Voronezh, RU|voronezh-speedtest.corbina.net|5201"
+        "Voronezh, RU|st.voronezh.ertelecom.ru|${P}"
+        "Kazan, RU|kazst.st.mtsws.net|3333"
+        "Kazan, RU|st.kzn.ertelecom.ru|5202 5203 5204 5205 5206"
+        "Krasnodar, RU|kndst.st.mtsws.net|3333"
+        "Rostov, RU|st.rostov.ertelecom.ru|${P}"
+        "Samara, RU|st.samara.ertelecom.ru|${P}"
+        "Yekaterinburg, RU|st.ekat.ertelecom.ru|${P}"
+        "Novosibirsk, RU|st.nsk.ertelecom.ru|${P}"
+    )
+    local want=5
+
+    if ! install_iperf3; then
+        _red " Не удалось установить iperf3 (apt install iperf3)\n"
+        return 0
     fi
+
+    # 1) Параллельно проверяем доступность и задержку всех серверов
+    local tmp="./iperf_probe.txt" i
+    : >"${tmp}"
+    for i in "${!pool[@]}"; do
+        (
+            IFS='|' read -r _c _h _p <<<"${pool[$i]}"
+            r="$(tcp_probe "${_h}" "${_p}")" && echo "${r}|${i}" >>"${tmp}"
+        ) &
+    done
+    wait
+
+    if [[ ! -s "${tmp}" ]]; then
+        _red " Российские iperf3-серверы недоступны с этого хоста\n"
+        rm -f "${tmp}"
+        return 0
+    fi
+
+    # 2) Берём самые быстрые по задержке, по одному на город, пока не наберём 5 успешных
+    local done_cities="|" ok=0 idx city host ports
+    while IFS='|' read -r _ idx; do
+        IFS='|' read -r city host ports <<<"${pool[$idx]}"
+        [[ "${done_cities}" == *"|${city}|"* ]] && continue
+        if iperf_test "${host}" "${ports}" "${city}"; then
+            done_cities+="${city}|"
+            ok=$((ok + 1))
+            [[ ${ok} -ge ${want} ]] && break
+        fi
+    done < <(sort -t'|' -k1,1n "${tmp}")
+
+    rm -f "${tmp}" ./iperf_up.json ./iperf_dl.json
+    [[ ${ok} -eq 0 ]] && _red " Все iperf3-серверы заняты, попробуйте позже\n"
+    return 0
 }
 
 speed_default() {
@@ -200,7 +299,6 @@ speed() {
     else
         speed_default
     fi
-    return 0
 }
 
 io_test() {
@@ -409,6 +507,10 @@ install_speedtest() {
     if ! wget --no-check-certificate -q -T10 -O speedtest.tgz "${url1}"; then
         if ! wget --no-check-certificate -q -T10 -O speedtest.tgz "${url2}"; then
             _red "Error: Failed to download speedtest-cli.\n"
+            if [[ "${SERVER_COUNTRY}" == "RU" ]]; then
+                print_speed_header
+                return 0
+            fi
             exit 1
         fi
     fi
@@ -626,7 +728,14 @@ ipv4_info
 next
 print_io_test
 next
-install_speedtest && speed && cleanup
+if [[ "${SERVER_COUNTRY}" == "RU" ]]; then
+    echo " Speed test mode    : $(_yellow "Russia (iperf3, top-5 by latency)")"
+    print_speed_header
+    speed
+    cleanup
+else
+    install_speedtest && speed && cleanup
+fi
 next
 print_end_time
 next
