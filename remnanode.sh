@@ -1684,6 +1684,11 @@ load_caddy_domains() {
       proxy | docker:*) [[ -n "$u" ]] || u="-" ;;
       *) u="-" ;;
     esac
+    # up= потерян (например, domains.list пересохранила старая версия скрипта) — адрес приложения из его настроек.
+    if [[ "$s" == docker:* && "$u" == "-" ]]; then
+      u="$(app_upstream_from_meta "$d")"
+      [[ -n "$u" ]] || u="-"
+    fi
     CADDY_LISTENS+=("$l")
     CADDY_UPS+=("$u")
   done <"$f"
@@ -3599,7 +3604,13 @@ caddy_sites_show() {
     s="${CADDY_SITES[i]}"
     if [[ "$s" != "-" ]]; then
       desc="$s"
-      if site_is_proxy "$s"; then desc="$s → $(up_desc "${CADDY_UPS[i]:--}")"; fi
+      if site_is_proxy "$s"; then
+        if [[ "${CADDY_UPS[i]:--}" == "-" ]]; then
+          desc="$s → адрес не задан (Caddy отвечает 502; задайте: Добавить / изменить сайт → 3 или 4)"
+        else
+          desc="$s → $(up_desc "${CADDY_UPS[i]}")"
+        fi
+      fi
       if [[ "$s" == docker:* ]]; then desc="$desc [$(app_state_short "${CADDY_DOMAINS[i]}")]"; fi
       printf '  %s — %s — %s\n' "${CADDY_DOMAINS[i]}" "$desc" "$(site_url "${CADDY_DOMAINS[i]}" "${CADDY_LISTENS[i]}")" >&2
       found=1
@@ -3648,7 +3659,6 @@ caddy_site_set() {
     say "Сайт для $d: сейчас $cur, $(site_listen_desc "$listen") (порт меняется в «Сайты → Порт / доступ»)."
   fi
   case "$cur" in
-    own) def=2 ;;
     proxy) def=3 ;;
     docker:*) def=4 ;;
   esac
@@ -4433,6 +4443,22 @@ app_mode_desc() {
     hostnet) echo "network_mode: host, Caddy → host.docker.internal:$APP_HPORT" ;;
     *) echo "?" ;;
   esac
+}
+
+# Адрес приложения по его файлу настроек (без загрузки APP_*). Пусто — нет приложения.
+app_upstream_from_meta() {
+  local d="$1" f via cport hport
+  f="$(app_meta "$d")"
+  [[ -f "$f" ]] || return 0
+  via="$(sed -n 's/^VIA=//p' "$f" | head -n1)"
+  cport="$(sed -n 's/^CPORT=//p' "$f" | head -n1)"
+  hport="$(sed -n 's/^HPORT=//p' "$f" | head -n1)"
+  if [[ "$via" == "net" && -n "$cport" ]]; then
+    echo "$(app_alias "$d"):$cport"
+  elif [[ -n "$hport" ]]; then
+    echo "127.0.0.1:$hport"
+  fi
+  return 0
 }
 
 # Адрес приложения для Caddy (поле up= в domains.list).
