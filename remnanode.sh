@@ -202,6 +202,8 @@ CADDY_SITE_COUNT=0
 CF_PICKED=""
 CF_WRITE_ERR=""
 CERT_WAIT_SINCE=""
+CF_REP_SHOWN=""
+CF_REP_NETCHECK=0
 NEW_METHOD=""
 NEW_TOKEN="-"
 SITE_SRC_DIR=""
@@ -2259,13 +2261,15 @@ caddy_ensure_running() {
 }
 
 caddy_wait_cert() {
-  local d="$1" timeout="${2:-$CERT_WAIT_SECONDS}" t=0 cf=0 since shown="" recs line r_name r_zone r_val
+  local d="$1" timeout="${2:-$CERT_WAIT_SECONDS}" t=0 cf=0 since
   if caddy_cert_exists "$d"; then
     return 0
   fi
   if [[ "$(caddy_method_of "$d")" == "cf" ]]; then cf=1; fi
   since="$(($(date +%s) - 120))"
   CERT_WAIT_SINCE="$since"
+  CF_REP_SHOWN=""
+  CF_REP_NETCHECK=0
   say "Жду сертификат для $d (до ${timeout} с)…"
   while ((t < timeout)); do
     if caddy_cert_exists "$d"; then
@@ -2277,15 +2281,7 @@ caddy_wait_cert() {
       return 1
     fi
     if ((cf)); then
-      recs="$(cf_challenge_records "$d" "$since")"
-      while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        IFS='|' read -r r_name r_zone r_val <<<"$line"
-        [[ "$shown" != *"|$r_val|"* ]] || continue
-        shown="$shown|$r_val|"
-        cf_print_record "$d" "$r_name" "$r_zone" "$r_val"
-        say "Жду, пока Let's Encrypt проверит запись…"
-      done <<<"$recs"
+      cf_wait_report "$d" "$since"
     fi
     sleep 5
     t=$((t + 5))
@@ -2322,12 +2318,16 @@ caddy_failure_hints() {
     say "  • у токена Cloudflare есть права Zone → Zone → Read и Zone → DNS → Edit для зоны домена;"
     say "  • домен действительно обслуживается этим аккаунтом Cloudflare (NS-записи у Cloudflare);"
     say "  • подробная проверка с тестовой записью: Caddy → Cloudflare API-токены → Диагностика (или: $SCRIPT_NAME caddy token diag $d)."
-    cf_check_image_for_new_tokens || true
   else
     say "  • A-запись домена указывает на IP этого сервера (Cloudflare — серое облако; иначе используйте способ cf);"
     say "  • порт 80/tcp открыт снаружи (фаервол: ufw allow 80/tcp, security group у провайдера);"
   fi
   say "  • лимиты Let's Encrypt (много попыток подряд для одного домена)."
+  if [[ "$m" == "cf" ]]; then cf_check_image_for_new_tokens || true; fi
+  if [[ "${CF_REP_NETCHECK:-0}" == "0" ]] && err_is_network "$(docker logs --since "${CERT_WAIT_SINCE:-$(($(date +%s) - 600))}" "$CADDY_CONTAINER" 2>&1 | grep -E '"level":"(error|warn)"' || true)"; then
+    say ""
+    caddy_net_check
+  fi
 }
 
 print_cert_json() {
@@ -2728,6 +2728,49 @@ cf_print_record() {
   say "  Значение одноразовое: Let's Encrypt выдаёт новое на каждую попытку, после выдачи запись удаляется."
 }
 
+# Во время ожидания: показать каждую попытку DNS-01 и её итог (создана запись или нет). Состояние — CF_REP_SHOWN.
+cf_wait_report() {
+  local d="$1" since="$2" line i=0 r_name r_zone r_val st er key fq
+  fq="_acme-challenge.${d#\*.}"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    i=$((i + 1))
+    IFS='|' read -r r_name r_zone r_val st er <<<"$line"
+    key="#$i:"
+    if [[ "$CF_REP_SHOWN" != *"${key}rec "* ]]; then
+      CF_REP_SHOWN+="${key}rec "
+      say ""
+      say "Попытка DNS-01 №$i для $d:"
+      cf_print_record "$d" "$r_name" "$r_zone" "$r_val"
+    fi
+    if [[ ( "$st" == "created" || "$st" == "created_fail" || "$st" == "done" ) && "$CF_REP_SHOWN" != *"${key}ok "* ]]; then
+      CF_REP_SHOWN+="${key}ok "
+      say "  ✔ Caddy СОЗДАЛ запись в Cloudflare (попытка №$i) и ждёт, пока её увидит DNS."
+      if cf_api_has_txt "$d" "$fq" "$r_val"; then
+        say "  ✔ Проверено через API Cloudflare: запись на месте."
+      fi
+    fi
+    if [[ "$st" == "fail" && "$CF_REP_SHOWN" != *"${key}fail "* ]]; then
+      CF_REP_SHOWN+="${key}fail "
+      warn "✘ Caddy НЕ СМОГ создать запись (попытка №$i): $(cf_reason_ru "$er")"
+      say "    Эта попытка завершена; Caddy повторит её через 1–2 мин — обычно уже с НОВЫМ значением."
+      say "    Вписывать показанное значение вручную бесполезно: Let's Encrypt его уже не проверит."
+      if err_is_network "$er" && ((CF_REP_NETCHECK == 0)); then
+        CF_REP_NETCHECK=1
+        caddy_net_check
+      fi
+    fi
+    if [[ "$st" == "created_fail" && "$CF_REP_SHOWN" != *"${key}cf "* ]]; then
+      CF_REP_SHOWN+="${key}cf "
+      warn "✘ Запись была создана, но выдача сорвалась (попытка №$i): $(cf_reason_ru "$er")"
+      if err_is_network "$er" && ((CF_REP_NETCHECK == 0)); then
+        CF_REP_NETCHECK=1
+        caddy_net_check
+      fi
+    fi
+  done <<<"$(cf_attempts "$d" "$since")"
+}
+
 # Расшифровать типичные ошибки выдачи из лога Caddy (с момента $2). $3 — способ (cf/http/alpn).
 caddy_explain_cert_errors() {
   local d="$1" since="${2:-}" m="${3:-}" logs args=() found=0
@@ -2739,6 +2782,9 @@ caddy_explain_cert_errors() {
     say "  • $*"
   }
   say "Что видно в логах Caddy:"
+  if err_is_network "$logs"; then
+    _x "Caddy из своего контейнера не может достучаться до: $(err_hosts "$(grep -E 'TLS handshake timeout|i/o timeout|context deadline exceeded|Client\.Timeout|connection reset|connection refused|no such host|network is unreachable' <<<"$logs")") (таймаут/обрыв сети). Это проблема сети сервера или Docker, а не токена — подробности в проверке сети ниже."
+  fi
   if grep -q 'appears invalid' <<<"$logs"; then
     _x "модуль Cloudflare в Caddy не принял токен («appears invalid»). Если токен начинается с cfut_/cfat_ — образ Caddy старый: Caddy → «Обновить Docker-образ Caddy». Иначе проверьте, что токен скопирован целиком, без пробелов и кавычек."
   fi
@@ -2771,6 +2817,179 @@ caddy_explain_cert_errors() {
   fi
   ((found)) || say "  (известных ошибок не найдено — смотрите строки лога ниже)"
   unset -f _x
+}
+
+
+# Попытки DNS-01 для домена $1 по логу Caddy (с момента $2 — unix-время), по одной строке на попытку:
+#   имя|зона|значение|статус|ошибка
+# статус: пусто — ещё идёт; created — запись создана в Cloudflare, Caddy ждёт распространения;
+#         fail — создать запись не удалось; created_fail — создана, но выдача потом сорвалась; done — сертификат получен.
+cf_attempts() {
+  local d="$1" since="${2:-}" args=()
+  [[ -n "$since" ]] && args=(--since "$since")
+  docker logs ${args[@]+"${args[@]}"} "$CADDY_CONTAINER" 2>&1 | awk -v fq="_acme-challenge.${d#\*.}" -v id="$d" '
+    function field(s, k,   r) {
+      if (match(s, "\"" k "\":\"[^\"]*\"")) { r = substr(s, RSTART, RLENGTH); sub("^\"" k "\":\"", "", r); sub(/"$/, "", r); return r }
+      return ""
+    }
+    function flush() { if (n) print rn "|" zn "|" val "|" st "|" er }
+    index($0, "\"creating DNS record\"") && index($0, "\"dns_name\":\"" fq "\"") {
+      flush(); n = 1; rn = field($0, "record_name"); zn = field($0, "zone"); val = field($0, "record_data"); st = ""; er = ""; next
+    }
+    !n { next }
+    st == "" && index($0, "\"checking DNS propagation\"") && index($0, "\"expected_data\":\"" val "\"") { st = "created"; next }
+    (st == "" || st == "created") && index($0, "\"could not get certificate from issuer\"") && index($0, "\"identifier\":\"" id "\"") {
+      e = $0
+      if (match(e, /"error":".*"}$/)) e = substr(e, RSTART + 9, RLENGTH - 11)
+      gsub(/\\"/, "\"", e)
+      gsub(/\|/, "/", e)
+      er = e
+      st = (st == "created") ? "created_fail" : "fail"
+      next
+    }
+    (st == "" || st == "created") && index($0, "\"certificate obtained successfully\"") && index($0, "\"identifier\":\"" id "\"") { st = "done"; next }
+    END { flush() }
+  ' || true
+}
+
+# Хосты, до которых Caddy не дотянулся (из текста ошибки).
+err_hosts() {
+  local h
+  h="$(grep -oE '(Get|Head|Post|Put|Patch|Delete) "https://[A-Za-z0-9.-]+' <<<"$1" | sed -E 's/^[A-Za-z]+ "https:\/\///' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
+  if [[ -z "$h" ]]; then
+    h="$(grep -oE 'https://[A-Za-z0-9.-]+' <<<"$1" | sed 's|https://||' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
+  fi
+  echo "$h"
+}
+
+# Сетевая ли это ошибка (таймауты, сброс, DNS).
+err_is_network() {
+  grep -qE 'TLS handshake timeout|i/o timeout|context deadline exceeded|Client\.Timeout|connection reset|connection refused|no such host|server misbehaving|network is unreachable|no route to host' <<<"$1"
+}
+
+# Понятное объяснение ошибки создания записи / выдачи.
+cf_reason_ru() {
+  local e="$1" h
+  h="$(err_hosts "$e")"
+  if grep -qE 'TLS handshake timeout' <<<"$e"; then
+    echo "контейнер Caddy не смог установить HTTPS-соединение с ${h:-сервером} (TLS handshake timeout) — проблема сети, а не токена"
+  elif grep -qE 'i/o timeout|context deadline exceeded|Client\.Timeout' <<<"$e"; then
+    echo "контейнер Caddy не дождался ответа от ${h:-сервера} (таймаут сети)"
+  elif grep -qE 'no such host|server misbehaving' <<<"$e"; then
+    echo "в контейнере Caddy не работает DNS: не удалось узнать адрес ${h:-сервера}"
+  elif grep -qE 'connection reset|connection refused|network is unreachable|no route to host' <<<"$e"; then
+    echo "соединение с ${h:-сервером} из контейнера Caddy сброшено/недоступно"
+  elif grep -qE 'Code:10000|"code":10000|Authentication error|Code:9109' <<<"$e"; then
+    echo "у токена нет прав на запись DNS (нужно Zone → DNS → Edit)"
+  elif grep -qE 'Code:6003|Invalid request headers' <<<"$e"; then
+    echo "Cloudflare получил пустой токен — переменная токена не попала в контейнер"
+  elif grep -qE 'expected 1 zone, got 0' <<<"$e"; then
+    echo "токен не видит зону домена (нужно Zone → Zone → Read)"
+  elif grep -qE 'could not determine zone' <<<"$e"; then
+    echo "Caddy не смог определить зону домена через DNS ${CF_DNS_RESOLVER}"
+  else
+    echo "$e"
+  fi
+}
+
+# Проверить, есть ли в Cloudflare TXT-запись $2 со значением $3 (через API, с сервера). Нужен токен домена $1.
+cf_api_has_txt() {
+  local d="$1" fq="$2" val="$3" id tok zone zid resp
+  id="$(awk -v d="$d" '$1 == d { for (i = 2; i <= NF; i++) if ($i ~ /^token=/) { sub(/^token=/, "", $i); print $i } exit }' "$(caddy_domains_file)" 2>/dev/null)"
+  [[ -n "$id" && "$id" != "-" ]] || return 2
+  tok="$(caddy_env_get "CF_API_TOKEN_$id")"
+  [[ -n "$tok" ]] || return 2
+  zone="$(cf_zone_for "$tok" "$d")" || return 2
+  zid="$(cf_zone_id "$tok" "$zone")" || return 2
+  [[ -n "$zid" ]] || return 2
+  resp="$(cf_get "$tok" "/zones/${zid}/dns_records?type=TXT&name=${fq}")" || return 2
+  grep -qF "$val" <<<"$resp"
+}
+
+# Доступен ли HTTPS-адрес $1 из контейнера Caddy. Печатает «ok N» (секунд) или «fail текст» или «unknown».
+caddy_container_reach() {
+  local url="$1" out rc t0 t1
+  container_running "$CADDY_CONTAINER" || {
+    echo "unknown контейнер не запущен"
+    return 0
+  }
+  t0="$(date +%s)"
+  out="$(docker exec "$CADDY_CONTAINER" wget -q -T 12 -O /dev/null "$url" 2>&1)" && rc=0 || rc=$?
+  t1="$(date +%s)"
+  if ((rc == 0)) || grep -qE 'server returned error|HTTP/[0-9.]+ [0-9]{3}' <<<"$out"; then
+    echo "ok $((t1 - t0))"
+  elif grep -qiE 'not found|ssl_client|applet' <<<"$out"; then
+    echo "unknown в образе нет wget с HTTPS"
+  else
+    echo "fail $(tr '\n' ' ' <<<"$out" | cut -c1-150) ($((t1 - t0)) с)"
+  fi
+}
+
+# Доступен ли HTTPS-адрес с самого сервера по IPv4 / IPv6. $2: 4 или 6.
+host_reach() {
+  local url="$1" ip="$2" code
+  command -v curl >/dev/null 2>&1 || {
+    echo "unknown"
+    return 0
+  }
+  code="$(command curl -"$ip" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 12 "$url" 2>/dev/null || true)"
+  if [[ "$code" =~ ^[1-5][0-9][0-9] ]]; then
+    echo "ok ${code#* }"
+  else
+    echo "fail"
+  fi
+}
+
+# MTU интерфейса, через который сервер ходит в интернет.
+host_mtu() {
+  local dev
+  dev="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}' || true)"
+  [[ -n "$dev" && -r "/sys/class/net/$dev/mtu" ]] && echo "$dev $(cat "/sys/class/net/$dev/mtu")"
+  return 0
+}
+
+# Сеть из контейнера Caddy до Cloudflare API и Let's Encrypt + сравнение с сервером и MTU.
+caddy_net_check() {
+  local url name r h4 h6 hm cm bad=0
+  say "Проверка сети: сервер vs контейнер Caddy (Caddy ходит в интернет из контейнера):"
+  for url in "https://api.cloudflare.com/client/v4/" "https://acme-v02.api.letsencrypt.org/directory"; do
+    name="${url#https://}"
+    name="${name%%/*}"
+    h4="$(host_reach "$url" 4)"
+    h6="$(host_reach "$url" 6)"
+    r="$(caddy_container_reach "$url")"
+    say "  $name:"
+    say "    сервер IPv4: $([[ "$h4" == ok* ]] && echo "ок (${h4#ok } с)" || echo "НЕТ")   сервер IPv6: $([[ "$h6" == ok* ]] && echo "ок (${h6#ok } с)" || echo "нет")"
+    case "$r" in
+      ok*) say "    контейнер Caddy: ок (${r#ok } с)" ;;
+      unknown*) say "    контейнер Caddy: не проверить (${r#unknown })" ;;
+      *)
+        warn "контейнер Caddy: НЕ ДОСТУПЕН — ${r#fail }"
+        bad=1
+        if [[ "$h4" != ok* && "$h6" == ok* ]]; then
+          say "    → с сервера $name открывается только по IPv6, а контейнеры Docker ходят по IPv4: IPv4-маршрут до него не работает (провайдер / фильтрация)."
+        fi
+        ;;
+    esac
+  done
+  hm="$(host_mtu)"
+  cm="$(docker exec "$CADDY_CONTAINER" cat /sys/class/net/eth0/mtu 2>/dev/null || true)"
+  if [[ -n "$hm" && -n "$cm" ]]; then
+    say "  MTU: сервер (${hm% *}) ${hm#* }, контейнер Caddy $cm"
+    if ((cm > ${hm#* })); then
+      warn "MTU контейнера ($cm) больше, чем у сервера (${hm#* }) — типичная причина «TLS handshake timeout» из Docker."
+      say "    Исправление: в /etc/docker/daemon.json указать MTU для сетей Docker:"
+      say "      { \"mtu\": ${hm#* }, \"default-network-opts\": { \"bridge\": { \"com.docker.network.driver.mtu\": \"${hm#* }\" } } }"
+      say "    затем: systemctl restart docker; $SCRIPT_NAME caddy stop; $SCRIPT_NAME caddy start"
+      say "    (stop/start пересоздаёт сеть Caddy с новым MTU)."
+      bad=1
+    fi
+  fi
+  if ((bad)); then
+    say "  Пока контейнер Caddy не достаёт до этих адресов, способ cf (и выдача вообще) работать не будет — токен тут ни при чём."
+  else
+    say "  Сеть из контейнера в порядке."
+  fi
 }
 
 # Диагностика выдачи через Cloudflare для домена.
@@ -2839,6 +3058,7 @@ caddy_cf_diagnose() {
   else
     say "5) CAA: ${caa:-нет записей} — ок"
   fi
+  caddy_net_check
   if container_running "$CADDY_CONTAINER"; then
     if docker exec "$CADDY_CONTAINER" nslookup -type=NS "$zone" "$CF_DNS_RESOLVER" >/dev/null 2>&1; then
       say "6) Контейнер Caddy обращается к DNS $CF_DNS_RESOLVER — ок"
@@ -2853,12 +3073,21 @@ caddy_cf_diagnose() {
   else
     say "7) Сертификата для $d пока нет."
   fi
-  rec_lines="$(cf_challenge_records "$d" "$(($(date +%s) - 86400))")"
+  rec_lines="$(cf_attempts "$d" "$(($(date +%s) - 86400))")"
   if [[ -n "$rec_lines" ]]; then
     line="$(tail -n1 <<<"$rec_lines")"
-    local r_name r_zone r_val
-    IFS='|' read -r r_name r_zone r_val <<<"$line"
+    local r_name r_zone r_val r_st r_er
+    IFS='|' read -r r_name r_zone r_val r_st r_er <<<"$line"
+    say ""
+    say "Последняя попытка DNS-01 (всего за сутки: $(grep -c . <<<"$rec_lines")):"
     cf_print_record "$d" "$r_name" "$r_zone" "$r_val"
+    case "$r_st" in
+      done) say "  ✔ запись создана, сертификат получен." ;;
+      created) say "  ✔ Caddy создал запись в Cloudflare и ждёт её проверки." ;;
+      created_fail) warn "запись была создана, но выдача сорвалась: $(cf_reason_ru "$r_er")" ;;
+      fail) warn "✘ Caddy НЕ СМОГ создать запись: $(cf_reason_ru "$r_er")" ;;
+      *) say "  попытка ещё идёт." ;;
+    esac
   else
     say "Попыток DNS-01 для $d в логе за сутки не видно (запись появится при следующей попытке выдачи)."
   fi
@@ -2924,6 +3153,8 @@ caddy_token_check() {
       fi
     done
   done
+  say "(проверки выше сделаны с самого сервера; сертификат получает Caddy из своего контейнера — проверяю и оттуда)"
+  caddy_net_check
 }
 
 caddy_token_remove() {
