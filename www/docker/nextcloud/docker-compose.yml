@@ -1,0 +1,18 @@
+services:
+  nextcloud:
+    image: nextcloud:30-apache
+    container_name: nextcloud-honeypot
+    restart: unless-stopped
+    ports:
+      # Наружу не торчит — слушает только localhost, куда ходит Caddy с этого же хоста.
+      - "127.0.0.1:8080:80"
+    environment:
+      - NEXTCLOUD_TRUSTED_DOMAINS=${DOMAIN}
+      - OVERWRITEPROTOCOL=https
+      - OVERWRITECLIURL=https://${DOMAIN}
+      - OVERWRITEHOST=${DOMAIN}
+      - TRUSTED_PROXIES=127.0.0.1
+    volumes:
+      # Весь /var/www/html смонтирован в локальную папку рядом с этим файлом.
+      # Код + config.php + SQLite-база + данные — всё здесь. Перенёс папку — перенёс всё.
+      - ./nextcloud:/var/www/html
