@@ -200,6 +200,8 @@ CADDY_NEED_80=0
 CADDY_NEED_443=0
 CADDY_SITE_COUNT=0
 CF_PICKED=""
+CF_WRITE_ERR=""
+CERT_WAIT_SINCE=""
 NEW_METHOD=""
 NEW_TOKEN="-"
 SITE_SRC_DIR=""
@@ -247,6 +249,7 @@ Caddy (сертификаты для нод и сайты):
   caddy method [домен] [способ]  сменить способ выдачи сертификата для домена
   caddy cert                     подробный статус сертификатов + JSON для профиля Xray
   caddy token [list|add|check|remove [N]]   токены Cloudflare API
+  caddy token diag [домен]      диагностика выдачи через Cloudflare: права токена, запись DNS, TXT-запись, ошибки
   caddy site [list|set|update|remove] [домен]  сайт на домене (репозиторий, своя папка, прокси, Docker-приложение)
   caddy site proxy [домен] [адрес]  сайт = прокси: 127.0.0.1:ПОРТ, контейнер:ПОРТ или https://адрес
   caddy app [list|start|stop|restart|logs|pull|update|port|remove] [домен]  Docker-приложения сайтов (apps/<домен>/)
@@ -1972,6 +1975,7 @@ caddy_pick_domain() {
       site) [[ "$s" != "-" ]] || continue ;;
       repo) [[ "$s" == repo:* ]] || continue ;;
       docker) [[ "$s" == docker:* ]] || continue ;;
+      cf) [[ "${CADDY_METHODS[i]}" == "cf" ]] || continue ;;
     esac
     idxs+=("$i")
   done
@@ -2025,6 +2029,10 @@ caddy_write_caddyfile() {
       printf '\thttps_port %s\n' "$CADDY_INTERNAL_HTTPS_PORT"
     fi
     printf '\t%s\n' 'auto_https disable_redirects'
+    if in_list cf ${CADDY_METHODS[@]+"${CADDY_METHODS[@]}"}; then
+      echo "	# DNS-01 (cf): записывать создаваемые TXT-записи — скрипт показывает их при выдаче"
+      printf '\tlog acme_dns {\n\t\tlevel DEBUG\n\t\tinclude tls.issuance.acme.dns_manager\n\t}\n'
+    fi
     echo "	# без HTTP/3: 443/udp на хосте занят Hysteria2"
     printf '\tservers {\n\t\tprotocols h1 h2\n\t}\n'
     echo "}"
@@ -2251,10 +2259,13 @@ caddy_ensure_running() {
 }
 
 caddy_wait_cert() {
-  local d="$1" timeout="${2:-$CERT_WAIT_SECONDS}" t=0
+  local d="$1" timeout="${2:-$CERT_WAIT_SECONDS}" t=0 cf=0 since shown="" recs line r_name r_zone r_val
   if caddy_cert_exists "$d"; then
     return 0
   fi
+  if [[ "$(caddy_method_of "$d")" == "cf" ]]; then cf=1; fi
+  since="$(($(date +%s) - 120))"
+  CERT_WAIT_SINCE="$since"
   say "Жду сертификат для $d (до ${timeout} с)…"
   while ((t < timeout)); do
     if caddy_cert_exists "$d"; then
@@ -2264,6 +2275,17 @@ caddy_wait_cert() {
     if ! container_running "$CADDY_CONTAINER"; then
       warn "контейнер $CADDY_CONTAINER не запущен ($(container_state "$CADDY_CONTAINER"))."
       return 1
+    fi
+    if ((cf)); then
+      recs="$(cf_challenge_records "$d" "$since")"
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS='|' read -r r_name r_zone r_val <<<"$line"
+        [[ "$shown" != *"|$r_val|"* ]] || continue
+        shown="$shown|$r_val|"
+        cf_print_record "$d" "$r_name" "$r_zone" "$r_val"
+        say "Жду, пока Let's Encrypt проверит запись…"
+      done <<<"$recs"
     fi
     sleep 5
     t=$((t + 5))
@@ -2293,10 +2315,14 @@ caddy_failure_hints() {
   warn "Caddy не получил сертификат${d:+ для $d}. Последние строки логов $CADDY_CONTAINER:"
   docker logs --tail 40 "$CADDY_CONTAINER" 2>&1 || true
   say ""
+  caddy_explain_cert_errors "$d" "${CERT_WAIT_SINCE:-}" "$m"
+  say ""
   say "Проверьте:"
   if [[ "$m" == "cf" ]]; then
     say "  • у токена Cloudflare есть права Zone → Zone → Read и Zone → DNS → Edit для зоны домена;"
     say "  • домен действительно обслуживается этим аккаунтом Cloudflare (NS-записи у Cloudflare);"
+    say "  • подробная проверка с тестовой записью: Caddy → Cloudflare API-токены → Диагностика (или: $SCRIPT_NAME caddy token diag $d)."
+    cf_check_image_for_new_tokens || true
   else
     say "  • A-запись домена указывает на IP этого сервера (Cloudflare — серое облако; иначе используйте способ cf);"
     say "  • порт 80/tcp открыт снаружи (фаервол: ufw allow 80/tcp, security group у провайдера);"
@@ -2507,6 +2533,13 @@ cf_ask_new_token() {
         continue
       fi
       say "Токен видит зону $zone."
+      if cf_dns_write_test "$t" "$zone"; then
+        say "Токен может создавать DNS-записи в $zone (тестовая TXT создана и удалена)."
+      else
+        warn "токен НЕ может создавать DNS-записи в $zone: ${CF_WRITE_ERR}"
+        say "  Нужно право Zone → DNS → Edit — без него Caddy не получит сертификат."
+        prompt_yes_no "Всё равно сохранить этот токен?" n || continue
+      fi
     elif ! cf_token_valid "$t"; then
       warn "Cloudflare отклонил токен."
       continue
@@ -2516,6 +2549,9 @@ cf_ask_new_token() {
     CADDY_ENV_CHANGED=1
     CF_PICKED="$id"
     say "Токен сохранён как #$id в $(caddy_env_file)."
+    if cf_token_is_new "$t"; then
+      cf_check_image_for_new_tokens || warn "с этим токеном Caddy не запустится, пока образ не обновлён: Caddy → «Обновить Docker-образ Caddy»."
+    fi
     return 0
   done
 }
@@ -2538,6 +2574,296 @@ cf_pick_token() {
     say "Ни один сохранённый токен Cloudflare не видит зону домена $d — нужен ещё один."
   fi
   cf_ask_new_token "$d"
+}
+
+# --- Cloudflare: совместимость образа, проверка записи в DNS, запись DNS-01, расшифровка ошибок ---
+
+CF_MODULE_MIN_NEW_TOKENS="0.2.4"   # caddy-dns/cloudflare с поддержкой токенов cfut_/cfat_ (март 2026)
+
+# Токен нового формата (cfut_ — пользовательский, cfat_ — токен аккаунта)?
+cf_token_is_new() { [[ "$1" == cfut_* || "$1" == cfat_* ]]; }
+
+# Версия модуля dns.providers.cloudflare в образе Caddy (например 0.2.4). Пусто — не удалось узнать.
+caddy_cf_module_version() {
+  local out=""
+  command -v docker >/dev/null 2>&1 || return 0
+  if container_running "$CADDY_CONTAINER"; then
+    out="$(docker exec "$CADDY_CONTAINER" caddy list-modules --versions 2>/dev/null || true)"
+  fi
+  if [[ -z "$out" ]]; then
+    out="$(docker run --rm --entrypoint caddy "$CADDY_IMAGE" list-modules --versions 2>/dev/null || true)"
+  fi
+  awk '$1 == "dns.providers.cloudflare" { v = $2; sub(/^v/, "", v); print v; exit }' <<<"$out"
+}
+
+# Версия $1 >= $2 (формат x.y.z)?
+ver_ge() {
+  [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]]
+}
+
+# Есть ли в .env токены нового формата.
+cf_have_new_tokens() {
+  local id
+  for id in $(cf_token_ids); do
+    if cf_token_is_new "$(caddy_env_get "CF_API_TOKEN_$id")"; then return 0; fi
+  done
+  return 1
+}
+
+# Образ Caddy понимает токены cfut_/cfat_? Если нет — предложить скачать свежий образ.
+# return 1 — образ старый и пользователь отказался обновлять.
+cf_check_image_for_new_tokens() {
+  local v
+  cf_have_new_tokens || return 0
+  v="$(caddy_cf_module_version)"
+  if [[ -z "$v" ]]; then
+    warn "не удалось узнать версию модуля Cloudflare в образе $CADDY_IMAGE (образ ещё не скачан?)."
+    return 0
+  fi
+  if [[ "$v" != *.*.* ]] || ver_ge "$v" "$CF_MODULE_MIN_NEW_TOKENS"; then
+    say "Модуль Cloudflare в образе Caddy: v$v — токены нового формата (cfut_/cfat_) поддерживаются."
+    return 0
+  fi
+  warn "в образе Caddy модуль Cloudflare v$v — он НЕ принимает токены нового формата (cfut_… / cfat_…)."
+  say "  Caddy с таким токеном не запустится (ошибка «API token … appears invalid») — перестанут работать все домены."
+  say "  Поддержка появилась в caddy-dns/cloudflare v${CF_MODULE_MIN_NEW_TOKENS}; свежий образ $CADDY_IMAGE её содержит."
+  if prompt_yes_no "Скачать свежий образ Caddy сейчас (docker compose pull)?" y; then
+    dc "$(caddy_dir)" pull || {
+      warn "не удалось скачать образ."
+      return 1
+    }
+    CADDY_ENV_CHANGED=1
+    v="$(docker run --rm --entrypoint caddy "$CADDY_IMAGE" list-modules --versions 2>/dev/null | awk '$1 == "dns.providers.cloudflare" { v = $2; sub(/^v/, "", v); print v; exit }' || true)"
+    say "Образ обновлён (модуль Cloudflare: v${v:-?}). Контейнер Caddy будет пересоздан с новым образом."
+    return 0
+  fi
+  return 1
+}
+
+# ID зоны по имени (токен должен видеть зону).
+cf_zone_id() {
+  local tok="$1" zone="$2" resp
+  resp="$(cf_get "$tok" "/zones?name=${zone}")" || return 1
+  grep -oE '"id":[[:space:]]*"[0-9a-f]{32}"' <<<"$resp" | head -n1 | grep -oE '[0-9a-f]{32}'
+}
+
+# Может ли токен создавать DNS-записи в зоне: создать и сразу удалить тестовую TXT-запись.
+# Результат в CF_WRITE_ERR (текст ошибки Cloudflare, если нет).
+cf_dns_write_test() {
+  local tok="$1" zone="$2" zid resp rid name
+  CF_WRITE_ERR=""
+  zid="$(cf_zone_id "$tok" "$zone")" || true
+  if [[ -z "$zid" ]]; then
+    CF_WRITE_ERR="не удалось получить ID зоны $zone"
+    return 1
+  fi
+  name="_remnanode-sh-check.${zone}"
+  resp="$(curl -sS --max-time 15 -X POST -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" \
+    --data "{\"type\":\"TXT\",\"name\":\"${name}\",\"content\":\"remnanode-sh write test\",\"ttl\":60}" \
+    "${CF_API}/zones/${zid}/dns_records" 2>/dev/null || true)"
+  if ! grep -q '"success":[[:space:]]*true' <<<"$resp"; then
+    CF_WRITE_ERR="$(grep -oE '"message":[[:space:]]*"[^"]*"' <<<"$resp" | head -n1 | sed -E 's/"message":[[:space:]]*"//; s/"$//')"
+    [[ -n "$CF_WRITE_ERR" ]] || CF_WRITE_ERR="нет ответа от Cloudflare"
+    return 1
+  fi
+  rid="$(grep -oE '"id":[[:space:]]*"[0-9a-f]{32}"' <<<"$resp" | head -n1 | grep -oE '[0-9a-f]{32}' || true)"
+  if [[ -n "$rid" ]]; then
+    curl -sS --max-time 15 -X DELETE -H "Authorization: Bearer ${tok}" "${CF_API}/zones/${zid}/dns_records/${rid}" >/dev/null 2>&1 ||
+      warn "тестовая запись $name не удалилась — удалите её в Cloudflare вручную."
+  fi
+  return 0
+}
+
+# Публичный DNS-запрос через DNS-over-HTTPS (1.1.1.1). Печатает значения (data) по одному на строку.
+doh_query() {
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -fsS --max-time 8 -H 'accept: application/dns-json' \
+    "https://cloudflare-dns.com/dns-query?name=${1}&type=${2}" 2>/dev/null |
+    sed 's/\\"//g' | grep -oE '"data":"[^"]*' | sed 's/^"data":"//' || true
+}
+
+# Способ выдачи домена прямо из domains.list (не трогая массивы CADDY_*).
+caddy_method_of() {
+  local f
+  f="$(caddy_domains_file)"
+  [[ -f "$f" ]] || return 0
+  awk -v d="$1" '
+    { sub(/#.*/, "") }
+    $1 == d {
+      m = "http"
+      for (i = 2; i <= NF; i++) if ($i == "http" || $i == "alpn" || $i == "cf") m = $i
+      print m
+      exit
+    }' "$f"
+}
+
+# TXT-записи DNS-01, которые Caddy создавал для домена (из лога, с момента $2 — unix-время).
+# Строки: «имя_в_зоне|зона|значение».
+cf_challenge_records() {
+  local d="$1" since="${2:-}" args=()
+  [[ -n "$since" ]] && args=(--since "$since")
+  docker logs ${args[@]+"${args[@]}"} "$CADDY_CONTAINER" 2>&1 |
+    grep -F '"creating DNS record"' |
+    grep -F "\"dns_name\":\"_acme-challenge.${d#\*.}\"" |
+    sed -nE 's/.*"zone":"([^"]*)".*"record_name":"([^"]*)".*"record_data":"([^"]*)".*/\2|\1|\3/p' || true
+}
+
+# Показать TXT-запись, которую надо иметь в DNS для выдачи сертификата.
+cf_print_record() {
+  local d="$1" rname="$2" zone="$3" val="$4" fq pub
+  zone="${zone%.}"
+  fq="_acme-challenge.${d#\*.}"
+  say ""
+  say "DNS-01 для $d — запись, которая подтверждает владение доменом (Caddy создаёт её в Cloudflare сам):"
+  say "  Тип:       TXT"
+  say "  Имя:       ${rname}   (полностью: ${fq}; зона ${zone})"
+  say "  Значение:  ${val}"
+  say "  TTL:       Auto"
+  pub="$(doh_query "$fq" TXT)"
+  if grep -qxF "$val" <<<"$pub"; then
+    say "  В публичном DNS (1.1.1.1) запись уже видна."
+  else
+    say "  В публичном DNS (1.1.1.1) запись пока не видна."
+  fi
+  say "  Значение одноразовое: Let's Encrypt выдаёт новое на каждую попытку, после выдачи запись удаляется."
+}
+
+# Расшифровать типичные ошибки выдачи из лога Caddy (с момента $2). $3 — способ (cf/http/alpn).
+caddy_explain_cert_errors() {
+  local d="$1" since="${2:-}" m="${3:-}" logs args=() found=0
+  [[ -n "$since" ]] && args=(--since "$since")
+  logs="$(docker logs ${args[@]+"${args[@]}"} "$CADDY_CONTAINER" 2>&1 | grep -iE 'error|warn' | tail -n 300 || true)"
+  [[ -n "$logs" ]] || return 0
+  _x() {
+    found=1
+    say "  • $*"
+  }
+  say "Что видно в логах Caddy:"
+  if grep -q 'appears invalid' <<<"$logs"; then
+    _x "модуль Cloudflare в Caddy не принял токен («appears invalid»). Если токен начинается с cfut_/cfat_ — образ Caddy старый: Caddy → «Обновить Docker-образ Caddy». Иначе проверьте, что токен скопирован целиком, без пробелов и кавычек."
+  fi
+  if grep -qE 'Invalid request headers|Code:6003|"code":6003' <<<"$logs"; then
+    _x "Cloudflare получил пустой или испорченный токен (6003): переменная CF_API_TOKEN_N не попала в контейнер — проверьте $(caddy_env_file) и пересоздайте Caddy."
+  fi
+  if grep -qE 'Authentication error|Code:10000|"code":10000|Code:9109|Unauthorized to access requested resource' <<<"$logs"; then
+    _x "у токена нет прав на запись DNS (10000/9109): нужен Zone → DNS → Edit для зоны домена."
+  fi
+  if grep -qE 'expected 1 zone, got 0' <<<"$logs"; then
+    _x "токен не видит зону домена: нет права Zone → Zone → Read или зона в другом аккаунте Cloudflare."
+  fi
+  if grep -qE 'timed out waiting for record to fully propagate|propagation' <<<"$logs" && [[ "$m" == "cf" ]]; then
+    _x "запись создана, но Caddy не увидел её через ${CF_DNS_RESOLVER} за отведённое время: проверьте, что сервер может обращаться к DNS ${CF_DNS_RESOLVER} (порт 53 исходящий) и что NS домена — Cloudflare."
+  fi
+  if grep -qE 'could not determine zone' <<<"$logs"; then
+    _x "Caddy не смог определить зону домена через DNS ${CF_DNS_RESOLVER}: у домена нет NS-записей Cloudflare или контейнер не может обращаться к DNS (порт 53 исходящий)."
+  fi
+  if grep -qiE 'CAA' <<<"$logs"; then
+    _x "CAA-запись домена запрещает Let's Encrypt: удалите её или добавьте CAA 0 issue \"letsencrypt.org\"."
+  fi
+  if grep -qiE 'rateLimited|too many (certificates|failed authorizations|new orders)' <<<"$logs"; then
+    _x "сработал лимит Let's Encrypt — подождите (обычно до часа, при лимите на домен — до недели)."
+  fi
+  if grep -qE 'NXDOMAIN|no valid A records|DNS problem' <<<"$logs" && [[ "$m" != "cf" ]]; then
+    _x "Let's Encrypt не нашёл A/AAAA-запись домена или DNS отвечает с ошибкой — проверьте записи домена."
+  fi
+  if grep -qE 'Timeout during connect|Connection refused|connection reset' <<<"$logs" && [[ "$m" != "cf" ]]; then
+    _x "Let's Encrypt не достучался до сервера по 80/tcp — фаервол/провайдер, или A-запись указывает не сюда (оранжевое облако Cloudflare → используйте способ cf)."
+  fi
+  ((found)) || say "  (известных ошибок не найдено — смотрите строки лога ниже)"
+  unset -f _x
+}
+
+# Диагностика выдачи через Cloudflare для домена.
+caddy_cf_diagnose() {
+  local d="${1:-}" id tok zone rec_lines line v ns caa
+  require_caddy
+  require_docker
+  cf_require_curl
+  if [[ -z "$d" ]]; then
+    caddy_pick_domain cf "Домен (способ cf)" || {
+      say "Отмена."
+      return 0
+    }
+    d="$CADDY_PICKED"
+  fi
+  d="$(normalize_domain "$d")"
+  caddy_has_domain "$d" || die "Домена $d нет в Caddy."
+  [[ "${CADDY_METHODS[$CADDY_IDX]}" == "cf" ]] || die "У домена $d способ ${CADDY_METHODS[$CADDY_IDX]}, а не cf."
+  id="${CADDY_TOKENS[$CADDY_IDX]}"
+  tok="$(caddy_env_get "CF_API_TOKEN_$id")"
+  say "=== Диагностика DNS-01 (Cloudflare) для $d ==="
+  if [[ -z "$tok" ]]; then
+    warn "токена #$id нет в $(caddy_env_file) — назначьте токен: Caddy → «Сменить способ выдачи» → cf."
+    return 0
+  fi
+  say "1) Токен #$id $(cf_mask "$tok") — формат: $(cf_token_is_new "$tok" && echo "новый (cfut_/cfat_)" || echo "классический")"
+  v="$(caddy_cf_module_version)"
+  if [[ -z "$v" ]]; then
+    warn "   версию модуля Cloudflare в образе узнать не удалось."
+  elif cf_token_is_new "$tok" && [[ "$v" == *.*.* ]] && ! ver_ge "$v" "$CF_MODULE_MIN_NEW_TOKENS"; then
+    warn "   модуль Cloudflare в образе v$v — НЕ понимает такой токен (нужно ≥ v${CF_MODULE_MIN_NEW_TOKENS})."
+    cf_check_image_for_new_tokens && {
+      caddy_net_prepare
+      dc "$(caddy_dir)" up -d --force-recreate
+      CADDY_ENV_CHANGED=0
+    }
+  else
+    say "   модуль Cloudflare в образе: v$v — ок"
+  fi
+  if ! cf_token_valid "$tok"; then
+    warn "2) Cloudflare отклонил токен (отозван, истёк или скопирован не полностью)."
+    return 0
+  fi
+  if ! zone="$(cf_zone_for "$tok" "$d")"; then
+    warn "2) токен не видит зону домена $d — нужно право Zone → Zone → Read на эту зону."
+    return 0
+  fi
+  say "2) Токен рабочий, зона: $zone"
+  if cf_dns_write_test "$tok" "$zone"; then
+    say "3) Запись DNS: токен может создавать записи (тестовая TXT создана и удалена) — ок"
+  else
+    warn "3) токен НЕ может создавать записи в $zone: ${CF_WRITE_ERR}"
+    say "   Нужно право Zone → DNS → Edit. Без него Caddy не создаст TXT-запись и сертификат не выдадут."
+  fi
+  ns="$(doh_query "$zone" NS | tr '\n' ' ')"
+  if [[ -z "$ns" ]]; then
+    warn "4) не удалось получить NS зоны $zone через 1.1.1.1."
+  elif [[ "$ns" == *cloudflare.com* ]]; then
+    say "4) NS зоны — Cloudflare ($ns) — ок"
+  else
+    warn "4) NS зоны $zone не у Cloudflare: $ns — записи, созданные через API Cloudflare, никто не увидит."
+  fi
+  caa="$(doh_query "$zone" CAA | tr '\n' ';')"
+  if [[ -n "$caa" && "$caa" != *letsencrypt* ]]; then
+    warn "5) у зоны есть CAA-записи без letsencrypt.org ($caa) — Let's Encrypt откажет."
+  else
+    say "5) CAA: ${caa:-нет записей} — ок"
+  fi
+  if container_running "$CADDY_CONTAINER"; then
+    if docker exec "$CADDY_CONTAINER" nslookup -type=NS "$zone" "$CF_DNS_RESOLVER" >/dev/null 2>&1; then
+      say "6) Контейнер Caddy обращается к DNS $CF_DNS_RESOLVER — ок"
+    else
+      warn "6) контейнер Caddy не получил ответ от DNS $CF_DNS_RESOLVER — проверка распространения записи не пройдёт (исходящий порт 53?)."
+    fi
+  else
+    warn "6) контейнер Caddy не запущен ($(container_state "$CADDY_CONTAINER"))."
+  fi
+  if caddy_cert_exists "$d"; then
+    say "7) Сертификат для $d есть: $(caddy_cert_root)/$d/"
+  else
+    say "7) Сертификата для $d пока нет."
+  fi
+  rec_lines="$(cf_challenge_records "$d" "$(($(date +%s) - 86400))")"
+  if [[ -n "$rec_lines" ]]; then
+    line="$(tail -n1 <<<"$rec_lines")"
+    local r_name r_zone r_val
+    IFS='|' read -r r_name r_zone r_val <<<"$line"
+    cf_print_record "$d" "$r_name" "$r_zone" "$r_val"
+  else
+    say "Попыток DNS-01 для $d в логе за сутки не видно (запись появится при следующей попытке выдачи)."
+  fi
+  say ""
+  caddy_explain_cert_errors "$d" "$(($(date +%s) - 86400))" cf
 }
 
 caddy_tokens_show() {
@@ -2573,6 +2899,8 @@ caddy_token_check() {
     return 0
   fi
   load_caddy_domains
+  cf_check_image_for_new_tokens || true
+  local zone
   for id in $(cf_token_ids); do
     tok="$(caddy_env_get "CF_API_TOKEN_$id")"
     if cf_token_valid "$tok"; then
@@ -2584,8 +2912,12 @@ caddy_token_check() {
     for ((i = 0; i < ${#CADDY_DOMAINS[@]}; i++)); do
       d="${CADDY_DOMAINS[i]}"
       if [[ "${CADDY_METHODS[i]}" == "cf" && "${CADDY_TOKENS[i]}" == "$id" ]]; then
-        if cf_zone_for "$tok" "$d" >/dev/null; then
-          say "    $d: зона доступна"
+        if zone="$(cf_zone_for "$tok" "$d")"; then
+          if cf_dns_write_test "$tok" "$zone"; then
+            say "    $d: зона $zone доступна, запись DNS разрешена"
+          else
+            warn "    $d: зона $zone видна, но создавать записи нельзя (${CF_WRITE_ERR}) — нужно Zone → DNS → Edit."
+          fi
         else
           warn "    $d: токен #$id не видит зону этого домена."
         fi
@@ -7393,6 +7725,7 @@ menu_caddy_tokens() {
     echo " 2) Добавить токен"
     echo " 3) Проверить токены (и доступ к зонам доменов)"
     echo " 4) Удалить токен"
+    echo " 5) Диагностика выдачи через Cloudflare (домен): права, запись DNS, TXT-запись, ошибки"
     echo " 0) Назад"
     read -r -p "Выберите пункт: " c || exit 0
     case "$(trim "$c")" in
@@ -7400,6 +7733,7 @@ menu_caddy_tokens() {
       2) run_action caddy_token_add ;;
       3) run_action caddy_token_check ;;
       4) run_action caddy_token_remove ;;
+      5) run_action caddy_cf_diagnose ;;
       0 | q) return 0 ;;
       *) ;;
     esac
@@ -7478,7 +7812,8 @@ cli_caddy() {
         add) caddy_token_add ;;
         check) caddy_token_check ;;
         remove | rm | del) caddy_token_remove "${3:-}" ;;
-        *) die "caddy token: list | add | check | remove [N]" ;;
+        diag | diagnose | doctor) caddy_cf_diagnose "${3:-}" ;;
+        *) die "caddy token: list | add | check | remove [N] | diag [домен]" ;;
       esac
       ;;
     site | sites)

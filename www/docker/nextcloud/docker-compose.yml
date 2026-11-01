@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     ports:
       # Наружу не торчит — слушает только localhost, куда ходит Caddy с этого же хоста.
-      - "127.0.0.1:8080:80"
+      - "8180:80"
     environment:
       - NEXTCLOUD_TRUSTED_DOMAINS=${DOMAIN}
       - OVERWRITEPROTOCOL=https
