@@ -58,7 +58,7 @@ ACME_CA="https://acme-v02.api.letsencrypt.org/directory"
 CADDY_INTERNAL_HTTPS_PORT=8443         # если 443 не нужен (нет сайтов и alpn): внутренний HTTPS-порт Caddy, наружу не публикуется
 CADDY_HTTPS_BIND="127.0.0.1"           # HTTPS Caddy (443 внутри контейнера) публикуется только на этом адресе хоста…
 CADDY_HTTPS_HOST_PORT=3443             # …и на этом порту. Снаружи на 443 — через HAProxy (443 → 127.0.0.1:3443)
-CADDY_OUT_PROXY_DEFAULT="socks5://adm:adm194.135.23.213:55410"             # прокси для Caddy → Cloudflare API и Let's Encrypt, например socks5://1.2.3.4:1080
+CADDY_OUT_PROXY_DEFAULT="socks5://adm:adm@194.135.23.213:55410"             # прокси для Caddy → Cloudflare API и Let's Encrypt, например socks5://1.2.3.4:1080
                                        # или socks5://логин:пароль@1.2.3.4:1080, http://1.2.3.4:3128; пусто — напрямую.
                                        # Значение из меню (Caddy → Прокси) хранится в caddy/.env и важнее этого.
 CF_DNS_RESOLVER="1.1.1.1"              # резолвер для проверки TXT-записей при DNS-01 (Cloudflare)
