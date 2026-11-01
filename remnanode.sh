@@ -58,7 +58,8 @@ ACME_CA="https://acme-v02.api.letsencrypt.org/directory"
 CADDY_INTERNAL_HTTPS_PORT=8443         # если 443 не нужен (нет сайтов и alpn): внутренний HTTPS-порт Caddy, наружу не публикуется
 CADDY_HTTPS_BIND="127.0.0.1"           # HTTPS Caddy (443 внутри контейнера) публикуется только на этом адресе хоста…
 CADDY_HTTPS_HOST_PORT=3443             # …и на этом порту. Снаружи на 443 — через HAProxy (443 → 127.0.0.1:3443)
-CADDY_OUT_PROXY_DEFAULT="socks5://adm:adm@194.135.23.213:55410"             # прокси для Caddy → Cloudflare API и Let's Encrypt, например socks5://1.2.3.4:1080
+CURL_TEST_IMAGE="curlimages/curl:8.11.1"   # для сквозной проверки маршрута из сети контейнера Caddy
+CADDY_OUT_PROXY_DEFAULT=""             # прокси для Caddy → Cloudflare API и Let's Encrypt, например socks5://1.2.3.4:1080
                                        # или socks5://логин:пароль@1.2.3.4:1080, http://1.2.3.4:3128; пусто — напрямую.
                                        # Значение из меню (Caddy → Прокси) хранится в caddy/.env и важнее этого.
 CF_DNS_RESOLVER="1.1.1.1"              # резолвер для проверки TXT-записей при DNS-01 (Cloudflare)
@@ -2596,12 +2597,23 @@ caddy_proxy_sync_env() {
   done
 }
 
+# Адрес прокси для curl так, чтобы он вёл себя как Caddy: Go обрабатывает socks5 как socks5h
+# (адрес сайта определяет сам прокси), а curl с socks5 определяет адрес на этом сервере — из-за этого
+# проверка могла не проходить (например, сервер получает IPv6-адрес, а прокси IPv6 не умеет).
+proxy_for_curl() {
+  local u="$1"
+  case "$u" in
+    socks5://*) echo "socks5h://${u#socks5://}" ;;
+    *) echo "$u" ;;
+  esac
+}
+
 # curl с тем же прокси, что у Caddy (для проверок скрипта — чтобы «ок» значило «Caddy тоже достучится»).
 px_curl() {
   local p
   p="$(caddy_out_proxy 2>/dev/null || true)"
   if [[ -n "$p" ]] && proxy_valid "$p"; then
-    curl -x "$p" "$@"
+    curl -x "$(proxy_for_curl "$p")" "$@"
   else
     curl "$@"
   fi
@@ -2611,11 +2623,40 @@ px_curl() {
 proxy_test_host() {
   local p="$1" url code bad=0
   for url in "https://api.cloudflare.com/client/v4/" "https://acme-v02.api.letsencrypt.org/directory"; do
-    code="$(curl -x "$p" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 20 "$url" 2>/dev/null || true)"
+    code="$(curl -x "$(proxy_for_curl "$p")" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 20 "$url" 2>/dev/null || true)"
     if [[ "$code" =~ ^[1-5][0-9][0-9] ]]; then
       say "  через прокси ${url#https://} → ок (${code#* } с)"
     else
       warn "через прокси ${url#https://} → НЕ ОТКРЫЛСЯ"
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+
+# Сквозная проверка: curl в сетевом пространстве контейнера Caddy, через тот же прокси — ровно тот путь,
+# которым Caddy ходит к Cloudflare API и Let's Encrypt. return 1 — не прошла, 2 — проверить нечем.
+proxy_test_from_caddy() {
+  local ct="$1" cp url code bad=0
+  container_running "$CADDY_CONTAINER" || {
+    say "  контейнер Caddy не запущен — сквозную проверку сделаю после запуска."
+    return 2
+  }
+  if ! docker image inspect "$CURL_TEST_IMAGE" >/dev/null 2>&1; then
+    if ! docker pull -q "$CURL_TEST_IMAGE" >/dev/null 2>&1; then
+      warn "не удалось скачать $CURL_TEST_IMAGE — сквозную проверку из контейнера пропускаю."
+      return 2
+    fi
+  fi
+  # в отдельном контейнере имя host.docker.internal неизвестно — подставляем адрес docker-хоста
+  cp="$(proxy_for_curl "${ct/host.docker.internal/$(docker_host_ip)}")"
+  for url in "https://api.cloudflare.com/client/v4/" "https://acme-v02.api.letsencrypt.org/directory"; do
+    code="$(docker run --rm --network "container:${CADDY_CONTAINER}" "$CURL_TEST_IMAGE" \
+      -x "$cp" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 25 "$url" 2>/dev/null || true)"
+    if [[ "$code" =~ ^[1-5][0-9][0-9] ]]; then
+      say "  из сети Caddy через прокси ${url#https://} → ок (${code#* } с)"
+    else
+      warn "из сети Caddy через прокси ${url#https://} → НЕ ОТКРЫЛСЯ"
       bad=1
     fi
   done
@@ -2666,6 +2707,7 @@ caddy_proxy_set() {
     say "Прокси нужен, если из контейнера Caddy не открываются Cloudflare API / Let's Encrypt (таймауты, фильтрация)."
     say "Через прокси пойдут только запросы к Let's Encrypt и Cloudflare API; сайты и ноды — как раньше."
     say "  Форматы: socks5://хост:порт   socks5://логин:пароль@хост:порт   http://хост:порт"
+    say "  socks5:// и socks5h:// для Caddy одинаковы: адрес Cloudflare / Let's Encrypt определяет сам прокси."
     say "  Прокси на этом сервере: socks5://127.0.0.1:1080 (должен слушать не только 127.0.0.1 — проверю)."
     [[ -n "$cur" ]] && say "  Сейчас: $(proxy_mask "$cur")  (off — выключить)"
     v="$(ask_value "Адрес прокси" "")"
@@ -2708,7 +2750,10 @@ caddy_proxy_set() {
   fi
   caddy_drop_snapshot
   say "Прокси включён: Caddy ходит к Let's Encrypt и Cloudflare API через $(proxy_mask "$v")."
-  proxy_test_container "$(proxy_for_container "$v")" || true
+  say "Сквозная проверка из сети Caddy…"
+  local rc=0
+  proxy_test_from_caddy "$(proxy_for_container "$v")" || rc=$?
+  if ((rc == 2)); then proxy_test_container "$(proxy_for_container "$v")" || true; fi
 }
 
 caddy_proxy_off() {
@@ -2740,8 +2785,12 @@ caddy_proxy_test() {
     return 0
   fi
   say "Прокси: $(proxy_mask "$p")"
+  say "С сервера:"
   proxy_test_host "$p" || true
-  proxy_test_container "$(proxy_for_container "$p")" || true
+  say "Из сети контейнера Caddy (тот же путь, что у Caddy):"
+  local rc=0
+  proxy_test_from_caddy "$(proxy_for_container "$p")" || rc=$?
+  if ((rc == 2)); then proxy_test_container "$(proxy_for_container "$p")" || true; fi
   if [[ "$(caddy_env_get HTTPS_PROXY)" != "$(proxy_for_container "$p")" ]]; then
     warn "в caddy/.env прокси ещё не применён — примените: Caddy → Прокси → Задать (или перезапустите Caddy через меню)."
   fi
@@ -3297,7 +3346,12 @@ caddy_net_check() {
   px="$(caddy_out_proxy 2>/dev/null || true)"
   if [[ -n "$px" ]]; then
     say "Caddy ходит к Cloudflare API и Let's Encrypt через прокси $(proxy_mask "$px"):"
-    if proxy_test_host "$px" && proxy_test_container "$(proxy_for_container "$px")"; then
+    local prc=0
+    proxy_test_from_caddy "$(proxy_for_container "$px")" || prc=$?
+    if ((prc == 2)); then
+      proxy_test_host "$px" && proxy_test_container "$(proxy_for_container "$px")" && prc=0 || prc=1
+    fi
+    if ((prc == 0)); then
       say "  Путь через прокси в порядке. Ниже — прямой доступ, только для сравнения."
     else
       warn "через прокси не всё работает — см. выше (Caddy → Прокси → Проверить)."
