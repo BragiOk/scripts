@@ -58,6 +58,9 @@ ACME_CA="https://acme-v02.api.letsencrypt.org/directory"
 CADDY_INTERNAL_HTTPS_PORT=8443         # если 443 не нужен (нет сайтов и alpn): внутренний HTTPS-порт Caddy, наружу не публикуется
 CADDY_HTTPS_BIND="127.0.0.1"           # HTTPS Caddy (443 внутри контейнера) публикуется только на этом адресе хоста…
 CADDY_HTTPS_HOST_PORT=3443             # …и на этом порту. Снаружи на 443 — через HAProxy (443 → 127.0.0.1:3443)
+CADDY_OUT_PROXY_DEFAULT=""             # прокси для Caddy → Cloudflare API и Let's Encrypt, например socks5://1.2.3.4:1080
+                                       # или socks5://логин:пароль@1.2.3.4:1080, http://1.2.3.4:3128; пусто — напрямую.
+                                       # Значение из меню (Caddy → Прокси) хранится в caddy/.env и важнее этого.
 CF_DNS_RESOLVER="1.1.1.1"              # резолвер для проверки TXT-записей при DNS-01 (Cloudflare)
 CERT_WAIT_SECONDS=330                  # сколько ждать получения сертификата для одного домена
 CERTS_MOUNT_CONTAINER="/certs"         # куда монтируются сертификаты внутри нод
@@ -251,6 +254,7 @@ Caddy (сертификаты для нод и сайты):
   caddy method [домен] [способ]  сменить способ выдачи сертификата для домена
   caddy cert                     подробный статус сертификатов + JSON для профиля Xray
   caddy token [list|add|check|remove [N]]   токены Cloudflare API
+  caddy proxy [show|set АДРЕС|off|test]  прокси для Caddy → Cloudflare API и Let's Encrypt (socks5://, http://)
   caddy token diag [домен]      диагностика выдачи через Cloudflare: права токена, запись DNS, TXT-запись, ошибки
   caddy site [list|set|update|remove] [домен]  сайт на домене (репозиторий, своя папка, прокси, Docker-приложение)
   caddy site proxy [домен] [адрес]  сайт = прокси: 127.0.0.1:ПОРТ, контейнер:ПОРТ или https://адрес
@@ -353,18 +357,44 @@ run_as_root() {
 }
 
 # Да/нет. $2 — ответ по умолчанию (y|n), подставляется по Enter.
+# «Назад» из любого вопроса: ответ q (или й / назад) прерывает текущее действие и возвращает в меню.
+# Действие меню выполняется в подоболочке (run_action) — ей посылается USR1, и она завершается с кодом 130.
+# Вне меню (команды CLI) — завершается сам скрипт.
+ACTION_PID="$$"
+is_cancel_answer() {
+  local a
+  a="$(lower "$(trim "$1")")"
+  [[ "$a" == "q" || "$a" == "й" || "$a" == "назад" || "$a" == "back" ]]
+}
+cancel_action() {
+  # Вопрос может быть глубоко во вложенных $(…). Сначала — сигнал подоболочке действия (у неё trap: выйдет,
+  # как только закончится текущая команда), затем завершить промежуточные подоболочки, чтобы ни одна
+  # функция (например, цикл «введите домен») не спросила снова. SIGPIPE — bash не пишет о нём на экран.
+  local pid pp
+  kill -USR1 "$ACTION_PID" 2>/dev/null || true
+  pid="$BASHPID"
+  while [[ -n "$pid" && "$pid" != "$ACTION_PID" && "$pid" != "1" && -r "/proc/$pid/stat" ]]; do
+    pp="$(sed -E 's/^.*\) [A-Za-z] ([0-9]+) .*$/\1/' "/proc/$pid/stat" 2>/dev/null || true)"
+    [[ "$pp" =~ ^[0-9]+$ ]] || break
+    if [[ "$pid" != "$BASHPID" ]]; then kill -PIPE "$pid" 2>/dev/null || true; fi
+    pid="$pp"
+  done
+  exit 130
+}
+
 prompt_yes_no() {
   local def="${2:-y}"
   local p q
   if [[ "$def" == "y" ]]; then
-    p="[Y/n]"
+    p="[Y/n, q — назад]"
     q="y"
   else
-    p="[y/N]"
+    p="[y/N, q — назад]"
     q="n"
   fi
   local r
   read -r -p "$1 $p " r || true
+  if is_cancel_answer "$r"; then cancel_action; fi
   r="$(lower "$(trim "${r:-$q}")")"
   [[ -n "$r" ]] || r="$q"
   [[ "$r" == "y" || "$r" == "yes" || "$r" == "д" || "$r" == "да" ]]
@@ -374,10 +404,11 @@ prompt_yes_no() {
 ask_value() {
   local prompt="$1" def="${2:-}" r=""
   if [[ -n "$def" ]]; then
-    read -r -p "$prompt [Enter — $def]: " r || true
+    read -r -p "$prompt [Enter — $def; q — назад]: " r || true
   else
-    read -r -p "$prompt: " r || true
+    read -r -p "$prompt [q — назад]: " r || true
   fi
+  if is_cancel_answer "$r"; then cancel_action; fi
   r="$(trim "$r")"
   [[ -n "$r" ]] || r="$def"
   printf '%s' "$r"
@@ -1916,6 +1947,12 @@ caddy_compute_needs() {
       fi
     fi
   done
+  # прокси на этом же сервере (127.0.0.1) — контейнеру нужен host.docker.internal
+  local px
+  px="$(caddy_out_proxy 2>/dev/null || true)"
+  if [[ -n "$px" ]] && proxy_valid "$px" && proxy_is_local "$px"; then
+    CADDY_NEED_HOSTGW=1
+  fi
 }
 
 # Спецификация публикации HTTPS Caddy: «127.0.0.1:3443:443» (внутри контейнера по-прежнему 443).
@@ -2143,6 +2180,7 @@ caddy_write_all() {
   dir="$(caddy_dir)"
   mkdir -p "$dir/data" "$dir/config" "$dir/www" || die "Не удалось создать каталоги в $dir"
   caddy_ensure_env
+  caddy_proxy_sync_env
   caddy_write_caddyfile
   caddy_write_compose
 }
@@ -2430,6 +2468,307 @@ require_caddy() {
 }
 
 # =============================================================================
+# Caddy: исходящий прокси для Cloudflare API и Let's Encrypt
+# =============================================================================
+# Caddy получает HTTPS_PROXY/HTTP_PROXY через caddy/.env (env_file) — через прокси идут запросы к Let's Encrypt
+# (ACME) и к Cloudflare API (DNS-01). NO_PROXY собирается автоматически: localhost, host.docker.internal,
+# подсети Docker и адреса всех сайтов-прокси / Docker-приложений — они работают напрямую, как раньше.
+# Caddyfile и compose не меняются (кроме extra_hosts, если прокси на этом же сервере).
+
+PROXY_ENV_KEYS=(HTTPS_PROXY HTTP_PROXY NO_PROXY)
+
+# Задан ли прокси явно в caddy/.env (ключ есть — даже пустой = «выключен»).
+caddy_proxy_in_env() {
+  local f
+  f="$(caddy_env_file)"
+  [[ -f "$f" ]] && grep -q '^CADDY_OUT_PROXY=' "$f"
+}
+
+# Действующий прокси (как его видит сервер): из caddy/.env, иначе CADDY_OUT_PROXY_DEFAULT из начала скрипта.
+caddy_out_proxy() {
+  if caddy_proxy_in_env; then
+    caddy_env_get CADDY_OUT_PROXY
+  else
+    printf '%s' "${CADDY_OUT_PROXY_DEFAULT:-}"
+  fi
+}
+
+# Проверка формата: socks5:// socks5h:// http:// https://, [логин:пароль@]хост:порт.
+proxy_valid() {
+  local u="$1"
+  [[ "$u" =~ ^(socks5h?|https?)://([^@/[:space:]]+@)?[A-Za-z0-9._-]+:[0-9]+/?$ ]] || return 1
+  [[ "$u" != *'$'* && "$u" != *'#'* && "$u" != *','* ]] || return 1
+  valid_port "$(proxy_port "$u")"
+}
+proxy_host() {
+  local u="${1#*://}"
+  u="${u##*@}"
+  u="${u%/}"
+  echo "${u%:*}"
+}
+proxy_port() {
+  local u="${1%/}"
+  echo "${u##*:}"
+}
+proxy_mask() {
+  local u="$1"
+  if [[ "$u" == *@* ]]; then
+    echo "${u%%://*}://***@${u##*@}"
+  else
+    echo "$u"
+  fi
+}
+proxy_is_local() {
+  case "$(lower "$(proxy_host "$1")")" in
+    127.0.0.1 | localhost) return 0 ;;
+  esac
+  return 1
+}
+
+# Адрес прокси для контейнера: 127.0.0.1/localhost → host.docker.internal, socks5h → socks5 (Go и так
+# отдаёт имя хоста прокси для разрешения на его стороне).
+proxy_for_container() {
+  local u="${1%/}" scheme rest cred=""
+  scheme="${u%%://*}"
+  rest="${u#*://}"
+  if [[ "$rest" == *@* ]]; then
+    cred="${rest%@*}@"
+    rest="${rest##*@}"
+  fi
+  [[ "$scheme" == "socks5h" ]] && scheme="socks5"
+  if proxy_is_local "$u"; then
+    rest="host.docker.internal:$(proxy_port "$u")"
+  fi
+  echo "${scheme}://${cred}${rest}"
+}
+
+# NO_PROXY: всё, что Caddy должен открывать напрямую (сайты-прокси, приложения, локальные адреса).
+caddy_no_proxy_list() {
+  local list="localhost,127.0.0.1,::1,host.docker.internal,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
+  local i u h
+  load_caddy_domains
+  for ((i = 0; i < ${#CADDY_DOMAINS[@]}; i++)); do
+    u="${CADDY_UPS[i]:--}"
+    [[ "$u" != "-" ]] || continue
+    case "$u" in
+      http://* | https://*)
+        h="${u#*://}"
+        h="${h%%/*}"
+        h="${h%:*}"
+        ;;
+      *) h="$(up_host "$u")" ;;
+    esac
+    [[ -n "$h" && ",$list," != *",$h,"* ]] && list="$list,$h"
+  done
+  echo "$list"
+}
+
+# Привести HTTPS_PROXY/HTTP_PROXY/NO_PROXY в caddy/.env к текущей настройке. Меняет .env только при отличии
+# (изменение .env само вызывает пересоздание контейнера в caddy_commit).
+caddy_proxy_sync_env() {
+  local p ct np k cur
+  p="$(caddy_out_proxy)"
+  if [[ -z "$p" ]]; then
+    for k in "${PROXY_ENV_KEYS[@]}"; do
+      if grep -q "^${k}=" "$(caddy_env_file)" 2>/dev/null; then
+        caddy_env_del "$k"
+        CADDY_ENV_CHANGED=1
+      fi
+    done
+    return 0
+  fi
+  if ! proxy_valid "$p"; then
+    warn "прокси «$(proxy_mask "$p")» записан некорректно — Caddy работает без прокси. Исправьте: Caddy → Прокси."
+    return 0
+  fi
+  ct="$(proxy_for_container "$p")"
+  np="$(caddy_no_proxy_list)"
+  for k in HTTPS_PROXY HTTP_PROXY NO_PROXY; do
+    cur="$(caddy_env_get "$k")"
+    if [[ "$k" == "NO_PROXY" ]]; then
+      [[ "$cur" == "$np" ]] && continue
+      caddy_env_set "$k" "$np"
+    else
+      [[ "$cur" == "$ct" ]] && continue
+      caddy_env_set "$k" "$ct"
+    fi
+    CADDY_ENV_CHANGED=1
+  done
+}
+
+# curl с тем же прокси, что у Caddy (для проверок скрипта — чтобы «ок» значило «Caddy тоже достучится»).
+px_curl() {
+  local p
+  p="$(caddy_out_proxy 2>/dev/null || true)"
+  if [[ -n "$p" ]] && proxy_valid "$p"; then
+    curl -x "$p" "$@"
+  else
+    curl "$@"
+  fi
+}
+
+# Проверить прокси с сервера: Cloudflare API и Let's Encrypt через него. return 1 — хоть что-то не открылось.
+proxy_test_host() {
+  local p="$1" url code bad=0
+  for url in "https://api.cloudflare.com/client/v4/" "https://acme-v02.api.letsencrypt.org/directory"; do
+    code="$(curl -x "$p" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 20 "$url" 2>/dev/null || true)"
+    if [[ "$code" =~ ^[1-5][0-9][0-9] ]]; then
+      say "  через прокси ${url#https://} → ок (${code#* } с)"
+    else
+      warn "через прокси ${url#https://} → НЕ ОТКРЫЛСЯ"
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+
+# Доступен ли прокси из контейнера Caddy (TCP до хоста:порта прокси).
+proxy_test_container() {
+  local ct="$1" h pt out
+  container_running "$CADDY_CONTAINER" || {
+    say "  контейнер Caddy не запущен — проверю после запуска."
+    return 0
+  }
+  h="$(proxy_host "$ct")"
+  pt="$(proxy_port "$ct")"
+  out="$(docker exec "$CADDY_CONTAINER" wget -q -T 6 -O /dev/null "http://${h}:${pt}/" 2>&1 || true)"
+  if grep -qiE 'timed out|refused|bad address|unreachable|no route' <<<"$out"; then
+    warn "из контейнера Caddy прокси ${h}:${pt} недоступен ($(tr '\n' ' ' <<<"$out" | cut -c1-80))."
+    if [[ "$h" == "host.docker.internal" ]]; then
+      say "  Прокси на этом сервере должен слушать 0.0.0.0:${pt} или $(docker_host_ip):${pt}, а не только 127.0.0.1."
+    fi
+    return 1
+  fi
+  say "  из контейнера Caddy прокси ${h}:${pt} доступен."
+}
+
+caddy_proxy_show() {
+  local p src="caddy/.env"
+  require_caddy
+  p="$(caddy_out_proxy)"
+  caddy_proxy_in_env || src="CADDY_OUT_PROXY_DEFAULT в начале скрипта"
+  if [[ -z "$p" ]]; then
+    say "Прокси для Cloudflare API и Let's Encrypt: не задан (Caddy ходит напрямую)."
+    return 0
+  fi
+  say "Прокси для Cloudflare API и Let's Encrypt: $(proxy_mask "$p")  (источник: $src)"
+  say "  в контейнере: $(proxy_mask "$(proxy_for_container "$p")")"
+  say "  напрямую (NO_PROXY): $(caddy_no_proxy_list)"
+}
+
+# Задать прокси. $1 — адрес (пусто — спросить), «off» — выключить.
+caddy_proxy_set() {
+  local v="${1:-}" cur
+  require_caddy
+  require_docker
+  cur="$(caddy_out_proxy)"
+  if [[ -z "$v" ]]; then
+    say "Прокси нужен, если из контейнера Caddy не открываются Cloudflare API / Let's Encrypt (таймауты, фильтрация)."
+    say "Через прокси пойдут только запросы к Let's Encrypt и Cloudflare API; сайты и ноды — как раньше."
+    say "  Форматы: socks5://хост:порт   socks5://логин:пароль@хост:порт   http://хост:порт"
+    say "  Прокси на этом сервере: socks5://127.0.0.1:1080 (должен слушать не только 127.0.0.1 — проверю)."
+    [[ -n "$cur" ]] && say "  Сейчас: $(proxy_mask "$cur")  (off — выключить)"
+    v="$(ask_value "Адрес прокси" "")"
+    [[ -n "$v" ]] || {
+      say "Без изменений."
+      return 0
+    }
+  fi
+  v="$(trim "$v")"
+  case "$(lower "$v")" in
+    off | none | - | нет | выкл)
+      caddy_proxy_off
+      return
+      ;;
+  esac
+  proxy_valid "$v" || die "Некорректный адрес прокси: $(proxy_mask "$v"). Пример: socks5://1.2.3.4:1080 (без \$, # и запятых)."
+  if proxy_is_local "$v"; then
+    case "$(host_listen_scope "$(proxy_port "$v")")" in
+      none) warn "на порту $(proxy_port "$v") сейчас ничего не слушает." ;;
+      local)
+        warn "порт $(proxy_port "$v") слушается только на 127.0.0.1 — из контейнера Caddy он недоступен."
+        say "  Настройте прокси на 0.0.0.0:$(proxy_port "$v") (и закройте порт снаружи фаерволом) или на $(docker_host_ip):$(proxy_port "$v")."
+        ;;
+    esac
+    site_fw_allow_docker "$(proxy_port "$v")"
+  fi
+  say "Проверяю прокси с сервера…"
+  if ! proxy_test_host "$v"; then
+    prompt_yes_no "Через прокси не всё открылось. Всё равно сохранить?" n || {
+      say "Не сохранено."
+      return 0
+    }
+  fi
+  caddy_snapshot
+  caddy_env_set CADDY_OUT_PROXY "$v"
+  CADDY_ENV_CHANGED=1
+  if ! caddy_commit; then
+    caddy_restore_snapshot
+    die "Не удалось применить настройку — вернул как было."
+  fi
+  caddy_drop_snapshot
+  say "Прокси включён: Caddy ходит к Let's Encrypt и Cloudflare API через $(proxy_mask "$v")."
+  proxy_test_container "$(proxy_for_container "$v")" || true
+}
+
+caddy_proxy_off() {
+  require_caddy
+  require_docker
+  if [[ -z "$(caddy_out_proxy)" ]]; then
+    say "Прокси и так не задан."
+    return 0
+  fi
+  caddy_snapshot
+  # пустое значение в .env = «выключен», даже если в начале скрипта задан CADDY_OUT_PROXY_DEFAULT
+  caddy_env_set CADDY_OUT_PROXY ""
+  CADDY_ENV_CHANGED=1
+  if ! caddy_commit; then
+    caddy_restore_snapshot
+    die "Не удалось применить настройку — вернул как было."
+  fi
+  caddy_drop_snapshot
+  say "Прокси выключен: Caddy ходит к Let's Encrypt и Cloudflare API напрямую."
+}
+
+caddy_proxy_test() {
+  local p
+  require_caddy
+  p="$(caddy_out_proxy)"
+  if [[ -z "$p" ]]; then
+    say "Прокси не задан. Проверка прямого доступа:"
+    caddy_net_check
+    return 0
+  fi
+  say "Прокси: $(proxy_mask "$p")"
+  proxy_test_host "$p" || true
+  proxy_test_container "$(proxy_for_container "$p")" || true
+  if [[ "$(caddy_env_get HTTPS_PROXY)" != "$(proxy_for_container "$p")" ]]; then
+    warn "в caddy/.env прокси ещё не применён — примените: Caddy → Прокси → Задать (или перезапустите Caddy через меню)."
+  fi
+}
+
+menu_caddy_proxy() {
+  local c
+  while true; do
+    menu_header "Caddy — прокси для Cloudflare API и Let's Encrypt  [$(p="$(caddy_out_proxy 2>/dev/null || true)"; [[ -n "$p" ]] && proxy_mask "$p" || echo "не задан")]"
+    echo " 1) Показать настройку"
+    echo " 2) Задать / изменить прокси"
+    echo " 3) Проверить (с сервера и из контейнера Caddy)"
+    echo " 4) Выключить прокси"
+    echo " 0) Назад"
+    read -r -p "Выберите пункт: " c || exit 0
+    case "$(trim "$c")" in
+      1) run_action caddy_proxy_show ;;
+      2) run_action caddy_proxy_set ;;
+      3) run_action caddy_proxy_test ;;
+      4) run_action caddy_proxy_off ;;
+      0 | q) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+# =============================================================================
 # Cloudflare API (токены)
 # =============================================================================
 CF_API="https://api.cloudflare.com/client/v4"
@@ -2464,7 +2803,7 @@ cf_require_curl() {
 
 cf_get() {
   local tok="$1" path="$2"
-  curl -fsS --max-time 15 -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" "${CF_API}${path}" 2>/dev/null
+  px_curl -fsS --max-time 15 -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" "${CF_API}${path}" 2>/dev/null
 }
 
 # Токен рабочий (видит хотя бы список зон).
@@ -2509,8 +2848,9 @@ cf_ask_new_token() {
   say "  Права: Zone → Zone → Read и Zone → DNS → Edit; Zone Resources — нужные зоны (или All zones)."
   while true; do
     t=""
-    read -r -s -p "API-токен Cloudflare (ввод скрыт; Enter — отмена): " t || true
+    read -r -s -p "API-токен Cloudflare (ввод скрыт; Enter или q — назад): " t || true
     echo >&2
+    if is_cancel_answer "$t"; then cancel_action; fi
     t="$(trim "$t")"
     [[ -n "$t" ]] || return 1
     if [[ ! "$t" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
@@ -2658,7 +2998,7 @@ cf_dns_write_test() {
     return 1
   fi
   name="_remnanode-sh-check.${zone}"
-  resp="$(curl -sS --max-time 15 -X POST -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" \
+  resp="$(px_curl -sS --max-time 15 -X POST -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" \
     --data "{\"type\":\"TXT\",\"name\":\"${name}\",\"content\":\"remnanode-sh write test\",\"ttl\":60}" \
     "${CF_API}/zones/${zid}/dns_records" 2>/dev/null || true)"
   if ! grep -q '"success":[[:space:]]*true' <<<"$resp"; then
@@ -2668,7 +3008,7 @@ cf_dns_write_test() {
   fi
   rid="$(grep -oE '"id":[[:space:]]*"[0-9a-f]{32}"' <<<"$resp" | head -n1 | grep -oE '[0-9a-f]{32}' || true)"
   if [[ -n "$rid" ]]; then
-    curl -sS --max-time 15 -X DELETE -H "Authorization: Bearer ${tok}" "${CF_API}/zones/${zid}/dns_records/${rid}" >/dev/null 2>&1 ||
+    px_curl -sS --max-time 15 -X DELETE -H "Authorization: Bearer ${tok}" "${CF_API}/zones/${zid}/dns_records/${rid}" >/dev/null 2>&1 ||
       warn "тестовая запись $name не удалилась — удалите её в Cloudflare вручную."
   fi
   return 0
@@ -2677,7 +3017,7 @@ cf_dns_write_test() {
 # Публичный DNS-запрос через DNS-over-HTTPS (1.1.1.1). Печатает значения (data) по одному на строку.
 doh_query() {
   command -v curl >/dev/null 2>&1 || return 0
-  curl -fsS --max-time 8 -H 'accept: application/dns-json' \
+  px_curl -fsS --max-time 8 -H 'accept: application/dns-json' \
     "https://cloudflare-dns.com/dns-query?name=${1}&type=${2}" 2>/dev/null |
     sed 's/\\"//g' | grep -oE '"data":"[^"]*' | sed 's/^"data":"//' || true
 }
@@ -2864,14 +3204,16 @@ err_hosts() {
 
 # Сетевая ли это ошибка (таймауты, сброс, DNS).
 err_is_network() {
-  grep -qE 'TLS handshake timeout|i/o timeout|context deadline exceeded|Client\.Timeout|connection reset|connection refused|no such host|server misbehaving|network is unreachable|no route to host' <<<"$1"
+  grep -qE 'TLS handshake timeout|i/o timeout|context deadline exceeded|Client\.Timeout|connection reset|connection refused|no such host|server misbehaving|network is unreachable|no route to host|proxyconnect|socks connect' <<<"$1"
 }
 
 # Понятное объяснение ошибки создания записи / выдачи.
 cf_reason_ru() {
   local e="$1" h
   h="$(err_hosts "$e")"
-  if grep -qE 'TLS handshake timeout' <<<"$e"; then
+  if grep -qE 'proxyconnect|socks connect' <<<"$e"; then
+    echo "Caddy не смог подключиться к прокси $(proxy_mask "$(caddy_out_proxy 2>/dev/null || true)") (проверьте: Caddy → Прокси → Проверить)"
+  elif grep -qE 'TLS handshake timeout' <<<"$e"; then
     echo "контейнер Caddy не смог установить HTTPS-соединение с ${h:-сервером} (TLS handshake timeout) — проблема сети, а не токена"
   elif grep -qE 'i/o timeout|context deadline exceeded|Client\.Timeout' <<<"$e"; then
     echo "контейнер Caddy не дождался ответа от ${h:-сервера} (таймаут сети)"
@@ -2932,7 +3274,7 @@ host_reach() {
     echo "unknown"
     return 0
   }
-  code="$(command curl -"$ip" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 12 "$url" 2>/dev/null || true)"
+  code="$(curl -"$ip" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time 12 "$url" 2>/dev/null || true)"
   if [[ "$code" =~ ^[1-5][0-9][0-9] ]]; then
     echo "ok ${code#* }"
   else
@@ -2951,6 +3293,16 @@ host_mtu() {
 # Сеть из контейнера Caddy до Cloudflare API и Let's Encrypt + сравнение с сервером и MTU.
 caddy_net_check() {
   local url name r h4 h6 hm cm bad=0
+  local px
+  px="$(caddy_out_proxy 2>/dev/null || true)"
+  if [[ -n "$px" ]]; then
+    say "Caddy ходит к Cloudflare API и Let's Encrypt через прокси $(proxy_mask "$px"):"
+    if proxy_test_host "$px" && proxy_test_container "$(proxy_for_container "$px")"; then
+      say "  Путь через прокси в порядке. Ниже — прямой доступ, только для сравнения."
+    else
+      warn "через прокси не всё работает — см. выше (Caddy → Прокси → Проверить)."
+    fi
+  fi
   say "Проверка сети: сервер vs контейнер Caddy (Caddy ходит в интернет из контейнера):"
   for url in "https://api.cloudflare.com/client/v4/" "https://acme-v02.api.letsencrypt.org/directory"; do
     name="${url#https://}"
@@ -2985,8 +3337,11 @@ caddy_net_check() {
       bad=1
     fi
   fi
-  if ((bad)); then
+  if ((bad)) && [[ -n "$px" ]]; then
+    say "  Напрямую из контейнера адреса не открываются, но Caddy ходит к ним через прокси (см. выше)."
+  elif ((bad)); then
     say "  Пока контейнер Caddy не достаёт до этих адресов, способ cf (и выдача вообще) работать не будет — токен тут ни при чём."
+    say "  Обходной путь: Caddy → «Прокси для Cloudflare API и Let's Encrypt» ($SCRIPT_NAME caddy proxy set socks5://хост:порт)."
   else
     say "  Сеть из контейнера в порядке."
   fi
@@ -7566,16 +7921,24 @@ action_uninstall() {
 # =============================================================================
 
 # Выполнить действие в подоболочке: ошибка (die) не закрывает меню.
+LAST_ACTION_RC=0
 run_action_nopause() {
   local rc
   set +e
+  trap 'true' INT
   (
     set -e
+    ACTION_PID="$BASHPID"
+    trap 'exit 130' USR1 INT
     "$@"
   )
   rc=$?
+  trap - INT
   set -e
-  if [[ "$rc" -ne 0 ]]; then
+  LAST_ACTION_RC="$rc"
+  if [[ "$rc" -eq 130 ]]; then
+    echo "Отменено — возврат в меню." >&2
+  elif [[ "$rc" -ne 0 ]]; then
     echo "Действие завершилось с ошибкой (код $rc)." >&2
   fi
   return 0
@@ -7583,7 +7946,7 @@ run_action_nopause() {
 
 run_action() {
   run_action_nopause "$@"
-  pause
+  if [[ "$LAST_ACTION_RC" -ne 130 ]]; then pause; fi
 }
 
 kind_status_line() {
@@ -7832,6 +8195,7 @@ menu_caddy() {
     echo " 13) Обновить Docker-образ Caddy"
     echo " 14) Обновить монтирование ${CERTS_MOUNT_CONTAINER} в нодах"
     echo " 15) Удалить Caddy"
+    echo " 16) Прокси для Cloudflare API и Let's Encrypt…"
     echo "  0) Назад"
     read -r -p "Выберите пункт: " c || exit 0
     case "$(trim "$c")" in
@@ -7853,6 +8217,7 @@ menu_caddy() {
       13) run_action caddy_update ;;
       14) run_action action_sync_mounts ;;
       15) run_action caddy_uninstall ;;
+      16) menu_caddy_proxy ;;
       0 | q) return 0 ;;
       *) ;;
     esac
@@ -8032,6 +8397,15 @@ cli_caddy() {
     start) caddy_start ;;
     stop) caddy_stop ;;
     log | logs) caddy_logs ;;
+    proxy)
+      case "${2:-show}" in
+        show | status) caddy_proxy_show ;;
+        set) caddy_proxy_set "${3:-}" ;;
+        off | disable | none) caddy_proxy_off ;;
+        test | check) caddy_proxy_test ;;
+        *) die "caddy proxy: show | set [socks5://хост:порт] | off | test" ;;
+      esac
+      ;;
     domains | list | ls) caddy_show_domains ;;
     add) caddy_add_domain_flow "${2:-}" "${3:-}" ;;
     remove | rm | del | delete) caddy_remove_domain_flow "${2:-}" ;;
@@ -8103,6 +8477,7 @@ cli_haproxy() {
 }
 
 main() {
+  trap 'echo "Отменено." >&2; exit 130' USR1
   compute_base_dir
   local cmd="${1:-menu}"
   # Сразу переносим скрипт в каталог remnanode/ (если запущен из файла, а не через bash <(curl ...))
