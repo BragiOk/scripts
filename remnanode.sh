@@ -14,14 +14,16 @@
 #   ├── caddy/            docker-compose.yml, Caddyfile, domains.list, .env, data/, config/, www/
 #   ├── remnanode/        docker-compose.yml, log/
 #   ├── remnanode-hy2/    docker-compose.yml, log/
-#   └── haproxy/          docker-compose.yml, forwards.list, config/haproxy.cfg (если установлен)
+#   ├── haproxy/          docker-compose.yml, forwards.list, config/haproxy.cfg (если установлен)
+#   └── apps/<домен>/     Docker-приложения сайтов (из репозитория www/docker/<имя>/), если есть
 #
 # Если Caddy установлен, обе ноды монтируют каталог сертификатов на уровень выше:
 #   ../caddy/data/caddy/certificates/<CA> → /certs (только чтение)
 # Установка Caddy добавляет это монтирование в compose нод, удаление Caddy — убирает.
 #
 # У каждого домена в Caddy свой способ выдачи сертификата: http (HTTP-01), alpn (HTTP-01 + TLS-ALPN)
-# или cf (DNS-01 через Cloudflare API). На домене можно разместить статический сайт.
+# или cf (DNS-01 через Cloudflare API). На домене можно разместить сайт: статический (www/static/ в репозитории
+# или своя папка), прокси на адрес (127.0.0.1:ПОРТ, контейнер:ПОРТ, https://…) или Docker-приложение (www/docker/).
 # HTTPS Caddy (443 внутри контейнера) публикуется только на 127.0.0.1:3443 хоста. Чтобы сайт открывался
 # снаружи на 443 — HAProxy: 443 → 127.0.0.1:3443 (или Reality selfsteal с target 127.0.0.1:3443).
 
@@ -63,7 +65,19 @@ CERTS_MOUNT_CONTAINER="/certs"         # куда монтируются сер�
 # --- Сайты (статика; файлы лежат в caddy/www/<домен>/) ---
 SITES_REPO="BragiOk/scripts"           # GitHub-репозиторий с сайтами
 SITES_BRANCH="main"
-SITES_PATH="www"                       # папка в репозитории: www/<имя_сайта>/index.html
+SITES_PATH="www/static"                # папка в репозитории: www/static/<имя_сайта>/index.html
+SITES_LEGACY_PATH="www"                # запасной вариант (старая раскладка): www/<имя_сайта>/, если www/static/ нет
+SITES_DOCKER_PATH="www/docker"         # Docker-приложения: www/docker/<имя>/docker-compose.yml (+ .env и т. д.)
+
+# --- Docker-приложения и прокси (сайт = reverse_proxy на адрес / контейнер) ---
+APPS_DIR_NAME="apps"                   # приложения: ~/remnanode/apps/<домен>/ (отдельно от Caddy)
+APP_PROJECT_PREFIX="remnanode-app"     # имя compose-проекта приложения: remnanode-app-<домен-через-дефисы>
+APP_OVERRIDE_FILE="docker-compose.remnanode.yml"   # подключение приложения к сети Caddy (генерируется)
+APP_META_FILE=".remnanode-app"         # настройки приложения (шаблон, сервис, порты, режим)
+WEB_NETWORK="remnanode-web"            # общая Docker-сеть Caddy ↔ контейнеры сайтов
+DOCKER_HOST_BIND_DEFAULT="172.17.0.1"  # адрес docker-хоста (шлюз docker0), если не удалось определить
+DOCKER_SUBNETS="172.16.0.0/12"         # подсети Docker — для правила фаервола «контейнеры → сервис на хосте»
+DEFAULT_DELETE_APP_FILES=n             # удалить файлы/данные приложения при его удалении
 # Где открывать сайт (у каждого сайта своё, меняется в «Caddy → Сайты → Порт / доступ»):
 #   443 — https://домен/;  свой порт — https://домен:ПОРТ/;  локально 127.0.0.1:ПОРТ — для VLESS Reality selfsteal
 DEFAULT_SITE_PUBLIC_PORT=2053          # порт по умолчанию для «своего публичного» (2053 — из HTTPS-портов, которые проксирует Cloudflare)
@@ -169,7 +183,14 @@ CADDY_METHODS=()
 CADDY_TOKENS=()
 CADDY_SITES=()
 CADDY_LISTENS=()
+CADDY_UPS=()
 CADDY_EXTRA_SPECS=()
+CADDY_NEED_NET=0
+CADDY_NEED_HOSTGW=0
+SITE_UP=""
+REPO_TMP=""
+REPO_ROOT=""
+APP_PICKED=""
 SITE_LISTEN=""
 CADDY_IDX=-1
 CADDY_PICKED=""
@@ -226,7 +247,9 @@ Caddy (сертификаты для нод и сайты):
   caddy method [домен] [способ]  сменить способ выдачи сертификата для домена
   caddy cert                     подробный статус сертификатов + JSON для профиля Xray
   caddy token [list|add|check|remove [N]]   токены Cloudflare API
-  caddy site [list|set|update|remove] [домен]  сайт на домене (из репозитория или своя папка)
+  caddy site [list|set|update|remove] [домен]  сайт на домене (репозиторий, своя папка, прокси, Docker-приложение)
+  caddy site proxy [домен] [адрес]  сайт = прокси: 127.0.0.1:ПОРТ, контейнер:ПОРТ или https://адрес
+  caddy app [list|start|stop|restart|logs|pull|update|port|remove] [домен]  Docker-приложения сайтов (apps/<домен>/)
   caddy site listen [домен] [443|pub:ПОРТ|loc:ПОРТ]  где открывать сайт: 443 / свой порт / локально (Reality selfsteal)
   caddy email                    сменить email для Let's Encrypt
   caddy update                   обновить образ Caddy
@@ -458,6 +481,8 @@ caddy_compose() { echo "$(caddy_dir)/docker-compose.yml"; }
 caddy_installed() { [[ -f "$(caddy_compose)" ]]; }
 
 caddy_domains_file() { echo "$(caddy_dir)/domains.list"; }
+
+apps_dir() { echo "${REMNANODE_APPS_DIR:-$BASE_DIR/$APPS_DIR_NAME}"; }
 
 kind_dir() {
   case "$1" in
@@ -1612,7 +1637,8 @@ load_caddy_domains() {
   CADDY_TOKENS=()
   CADDY_SITES=()
   CADDY_LISTENS=()
-  local f line d m t s l w defm=""
+  CADDY_UPS=()
+  local f line d m t s l u w defm=""
   f="$(caddy_domains_file)"
   [[ -f "$f" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -1629,12 +1655,14 @@ load_caddy_domains() {
     t="-"
     s="-"
     l=""
+    u="-"
     for w in "$@"; do
       case "$w" in
         http | alpn | cf) m="$w" ;;
         token=*) t="${w#token=}" ;;
         site=*) s="${w#site=}" ;;
         listen=*) l="${w#listen=}" ;;
+        up=*) u="${w#up=}" ;;
       esac
     done
     if [[ -z "$m" ]]; then
@@ -1652,18 +1680,27 @@ load_caddy_domains() {
     CADDY_METHODS+=("$m")
     CADDY_TOKENS+=("$t")
     CADDY_SITES+=("$s")
+    case "$s" in
+      proxy | docker:*) [[ -n "$u" ]] || u="-" ;;
+      *) u="-" ;;
+    esac
     CADDY_LISTENS+=("$l")
+    CADDY_UPS+=("$u")
   done <"$f"
 }
 
 save_caddy_domains() {
   local f i n
-  local lines=("# <домен> <способ: http|alpn|cf> token=<N|-> site=<repo:имя|own|-> listen=<443|pub:ПОРТ|loc:ПОРТ|-> — управляется ${SCRIPT_NAME}")
+  local lines=("# <домен> <способ: http|alpn|cf> token=<N|-> site=<repo:имя|own|proxy|docker:шаблон|-> listen=<443|pub:ПОРТ|loc:ПОРТ|-> [up=<адрес>] — управляется ${SCRIPT_NAME}")
   f="$(caddy_domains_file)"
   mkdir -p "$(dirname "$f")" || die "Не удалось создать $(dirname "$f")"
   n=${#CADDY_DOMAINS[@]}
   for ((i = 0; i < n; i++)); do
-    lines+=("${CADDY_DOMAINS[i]} ${CADDY_METHODS[i]} token=${CADDY_TOKENS[i]} site=${CADDY_SITES[i]} listen=${CADDY_LISTENS[i]:--}")
+    if [[ "${CADDY_UPS[i]:--}" != "-" ]]; then
+      lines+=("${CADDY_DOMAINS[i]} ${CADDY_METHODS[i]} token=${CADDY_TOKENS[i]} site=${CADDY_SITES[i]} listen=${CADDY_LISTENS[i]:--} up=${CADDY_UPS[i]}")
+    else
+      lines+=("${CADDY_DOMAINS[i]} ${CADDY_METHODS[i]} token=${CADDY_TOKENS[i]} site=${CADDY_SITES[i]} listen=${CADDY_LISTENS[i]:--}")
+    fi
   done
   write_lines "$f" "${lines[@]}"
 }
@@ -1692,11 +1729,12 @@ caddy_append_domain() {
   CADDY_TOKENS+=("${3:--}")
   CADDY_SITES+=("${4:--}")
   CADDY_LISTENS+=("${5:--}")
+  CADDY_UPS+=("${6:--}")
 }
 
 caddy_delete_at() {
   local del="$1" i
-  local d=() m=() t=() s=() l=()
+  local d=() m=() t=() s=() l=() u=()
   for ((i = 0; i < ${#CADDY_DOMAINS[@]}; i++)); do
     if ((i != del)); then
       d+=("${CADDY_DOMAINS[i]}")
@@ -1704,6 +1742,7 @@ caddy_delete_at() {
       t+=("${CADDY_TOKENS[i]}")
       s+=("${CADDY_SITES[i]}")
       l+=("${CADDY_LISTENS[i]}")
+      u+=("${CADDY_UPS[i]:--}")
     fi
   done
   CADDY_DOMAINS=(${d[@]+"${d[@]}"})
@@ -1711,6 +1750,7 @@ caddy_delete_at() {
   CADDY_TOKENS=(${t[@]+"${t[@]}"})
   CADDY_SITES=(${s[@]+"${s[@]}"})
   CADDY_LISTENS=(${l[@]+"${l[@]}"})
+  CADDY_UPS=(${u[@]+"${u[@]}"})
 }
 
 caddy_remove_from_list() {
@@ -1736,6 +1776,95 @@ caddy_restore_snapshot() {
 
 caddy_drop_snapshot() { rm -f "$(caddy_domains_file).snap"; }
 
+# --- Прокси-цели сайтов (поле up= в domains.list) ---
+# Сайт — reverse_proxy (пункт «прокси» или Docker-приложение), а не файлы.
+site_is_proxy() { [[ "$1" == "proxy" || "$1" == docker:* ]]; }
+
+up_port() { echo "${1##*:}"; }
+up_host() { echo "${1%:*}"; }
+
+# Тип цели: url (http(s)://хост[:порт]) | host (сервис на этом сервере: 127.0.0.1 / localhost)
+# | net (контейнер в сети ${WEB_NETWORK}: имя без точек) | addr (IP или имя с точкой — как есть).
+up_kind() {
+  local tgt="$1" h
+  case "$tgt" in
+    http://* | https://*)
+      echo url
+      return 0
+      ;;
+  esac
+  h="$(lower "$(up_host "$tgt")")"
+  case "$h" in
+    127.0.0.1 | localhost | host.docker.internal) echo host ;;
+    *)
+      if [[ "$h" =~ ^[0-9.]+$ || "$h" == *.* ]]; then echo addr; else echo net; fi
+      ;;
+  esac
+}
+
+# Адрес для reverse_proxy в Caddyfile: сервис на хосте → host.docker.internal:ПОРТ.
+up_caddy_addr() {
+  local tgt="$1"
+  if [[ "$(up_kind "$tgt")" == "host" ]]; then
+    echo "host.docker.internal:$(up_port "$tgt")"
+  else
+    echo "$tgt"
+  fi
+}
+
+up_desc() {
+  local tgt="$1"
+  case "$(up_kind "$tgt")" in
+    host) echo "$tgt (Caddy → host.docker.internal:$(up_port "$tgt"))" ;;
+    net) echo "$tgt (контейнер, сеть ${WEB_NETWORK})" ;;
+    *) echo "$tgt" ;;
+  esac
+}
+
+# Общая Docker-сеть Caddy ↔ контейнеры сайтов (external: создаётся заранее, переживает пересоздание Caddy).
+web_net_ensure() {
+  require_docker
+  docker network inspect "$WEB_NETWORK" >/dev/null 2>&1 && return 0
+  docker network create "$WEB_NETWORK" >/dev/null || die "Не удалось создать Docker-сеть $WEB_NETWORK"
+  say "Создана Docker-сеть $WEB_NETWORK (Caddy ↔ контейнеры сайтов)."
+}
+
+# Перед запуском Caddy: если его compose использует сеть ${WEB_NETWORK} — создать её.
+caddy_net_prepare() {
+  grep -qE "^[[:space:]]+name: ${WEB_NETWORK}[[:space:]]*\$" "$(caddy_compose)" 2>/dev/null || return 0
+  web_net_ensure
+}
+
+# Сети контейнера (через пробел).
+container_networks() {
+  docker container inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1" 2>/dev/null || true
+}
+
+# Контейнеры из пункта «прокси» (контейнер:порт) подключить к сети ${WEB_NETWORK}, если ещё не подключены.
+# Docker-приложения подключаются своим compose (${APP_OVERRIDE_FILE}).
+caddy_net_connect_proxies() {
+  local i u name
+  command -v docker >/dev/null 2>&1 || return 0
+  load_caddy_domains
+  for ((i = 0; i < ${#CADDY_DOMAINS[@]}; i++)); do
+    [[ "${CADDY_SITES[i]}" == "proxy" ]] || continue
+    u="${CADDY_UPS[i]:--}"
+    [[ "$u" != "-" && "$(up_kind "$u")" == "net" ]] || continue
+    name="$(up_host "$u")"
+    if ! docker container inspect "$name" >/dev/null 2>&1; then
+      warn "контейнера «$name» нет — сайт ${CADDY_DOMAINS[i]} будет отвечать 502, пока он не появится."
+      continue
+    fi
+    [[ " $(container_networks "$name") " != *" $WEB_NETWORK "* ]] || continue
+    web_net_ensure
+    if docker network connect "$WEB_NETWORK" "$name" >/dev/null 2>&1; then
+      say "Контейнер $name подключён к сети $WEB_NETWORK."
+    else
+      warn "не удалось подключить контейнер $name к сети $WEB_NETWORK (у него network_mode: host? тогда укажите 127.0.0.1:ПОРТ)."
+    fi
+  done
+}
+
 # Какие порты нужны Caddy при текущем списке доменов.
 # CADDY_NEED_80 / CADDY_NEED_443 и CADDY_EXTRA_SPECS — порты сайтов на своих портах
 # («ПОРТ:ПОРТ» — публично, «127.0.0.1:ПОРТ:ПОРТ» — локально).
@@ -1745,6 +1874,8 @@ caddy_compute_needs() {
   CADDY_NEED_443=0
   CADDY_SITE_COUNT=0
   CADDY_EXTRA_SPECS=()
+  CADDY_NEED_NET=0
+  CADDY_NEED_HOSTGW=0
   n=${#CADDY_DOMAINS[@]}
   for ((i = 0; i < n; i++)); do
     case "${CADDY_METHODS[i]}" in
@@ -1766,6 +1897,12 @@ caddy_compute_needs() {
       esac
       if [[ -n "$spec" ]] && ! in_list "$spec" ${CADDY_EXTRA_SPECS[@]+"${CADDY_EXTRA_SPECS[@]}"}; then
         CADDY_EXTRA_SPECS+=("$spec")
+      fi
+      if site_is_proxy "${CADDY_SITES[i]}" && [[ "${CADDY_UPS[i]:--}" != "-" ]]; then
+        case "$(up_kind "${CADDY_UPS[i]}")" in
+          net) CADDY_NEED_NET=1 ;;
+          host) CADDY_NEED_HOSTGW=1 ;;
+        esac
       fi
     fi
   done
@@ -1808,7 +1945,11 @@ caddy_domain_info_short() {
   s="${CADDY_SITES[i]}"
   info="$m"
   if [[ "$m" == "cf" ]]; then info="cf (токен #$t)"; fi
-  if [[ "$s" != "-" ]]; then info="$info · сайт: $s, $(site_listen_desc "${CADDY_LISTENS[i]}")"; fi
+  if site_is_proxy "$s"; then
+    info="$info · сайт: $s → ${CADDY_UPS[i]:--}, $(site_listen_desc "${CADDY_LISTENS[i]}")"
+  elif [[ "$s" != "-" ]]; then
+    info="$info · сайт: $s, $(site_listen_desc "${CADDY_LISTENS[i]}")"
+  fi
   printf '%s' "$info"
 }
 
@@ -1825,6 +1966,7 @@ caddy_pick_domain() {
     case "$filter" in
       site) [[ "$s" != "-" ]] || continue ;;
       repo) [[ "$s" == repo:* ]] || continue ;;
+      docker) [[ "$s" == docker:* ]] || continue ;;
     esac
     idxs+=("$i")
   done
@@ -1860,7 +2002,7 @@ caddy_pick_domain() {
 # и смена inode сломала бы caddy reload.
 # shellcheck disable=SC2016
 caddy_write_caddyfile() {
-  local out tmp i n d m t s l
+  local out tmp i n d m t s l u
   out="$(caddy_dir)/Caddyfile"
   load_caddy_domains
   caddy_compute_needs
@@ -1913,7 +2055,16 @@ caddy_write_caddyfile() {
           printf '\ttls {\n\t\tdns cloudflare {env.CF_API_TOKEN_%s}\n\t\tresolvers %s\n\t}\n' "$t" "$CF_DNS_RESOLVER"
           ;;
       esac
-      if [[ "$s" != "-" ]]; then
+      if site_is_proxy "$s"; then
+        u="${CADDY_UPS[i]:--}"
+        if [[ "$u" == "-" ]]; then
+          printf '\trespond "no upstream" 502\n'
+        elif [[ "$(up_kind "$u")" == "url" ]]; then
+          printf '\treverse_proxy %s {\n\t\theader_up Host {upstream_hostport}\n\t}\n' "$u"
+        else
+          printf '\treverse_proxy %s\n' "$(up_caddy_addr "$u")"
+        fi
+      elif [[ "$s" != "-" ]]; then
         printf '\troot * /srv/%s\n\tfile_server\n' "$d"
       else
         printf '\trespond "OK"\n'
@@ -1929,7 +2080,7 @@ caddy_write_caddyfile() {
 }
 
 caddy_write_compose() {
-  local outfile cadir ports="" spec
+  local outfile cadir ports="" spec extra="" nets=""
   outfile="$(caddy_compose)"
   cadir="$(acme_ca_dir_name)"
   load_caddy_domains
@@ -1939,6 +2090,14 @@ caddy_write_compose() {
   done
   if [[ -n "$ports" ]]; then
     ports=$'\n    ports:'"$ports"
+  fi
+  # Только если есть сайты-прокси: сервис на хосте (host.docker.internal) и/или контейнеры (сеть ${WEB_NETWORK}).
+  if ((CADDY_NEED_HOSTGW)); then
+    extra+=$'\n    extra_hosts:\n      - "host.docker.internal:host-gateway"'
+  fi
+  if ((CADDY_NEED_NET)); then
+    extra+=$'\n    networks:\n      - default\n      - '"${WEB_NETWORK}"
+    nets=$'\n\nnetworks:\n  '"${WEB_NETWORK}"$':\n    external: true\n    name: '"${WEB_NETWORK}"
   fi
   cat >"$outfile" <<EOF2
 # ${CADDY_MARKER}
@@ -1960,7 +2119,7 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./data:/data
       - ./config:/config
-      - ./www:/srv:ro
+      - ./www:/srv:ro${extra}${nets}
 EOF2
 }
 
@@ -2048,12 +2207,14 @@ caddy_commit() {
   if [[ -n "$force" || "$before" != "$after" || "${CADDY_ENV_CHANGED:-0}" == "1" ]] || ! container_running "$CADDY_CONTAINER"; then
     dc "$dir" config >/dev/null || die "docker compose config: ошибка в $(caddy_compose)"
     ensure_container_name_free "$CADDY_CONTAINER" "$dir"
-    say "Пересоздаю контейнер Caddy (изменились порты/токены/образ)…"
+    caddy_net_prepare
+    say "Пересоздаю контейнер Caddy (изменились порты/сети/токены/образ)…"
     dc "$dir" up -d --force-recreate
     CADDY_ENV_CHANGED=0
   else
     caddy_apply_config
   fi
+  caddy_net_connect_proxies
 }
 
 # Применить новый Caddyfile: reload в работающем контейнере, иначе запуск.
@@ -2069,6 +2230,7 @@ caddy_apply_config() {
     docker restart "$CADDY_CONTAINER" >/dev/null
   else
     ensure_container_name_free "$CADDY_CONTAINER" "$dir"
+    caddy_net_prepare
     dc "$dir" up -d
   fi
 }
@@ -2079,6 +2241,7 @@ caddy_ensure_running() {
   dir="$(caddy_dir)"
   say "Caddy не запущен — запускаю…"
   ensure_container_name_free "$CADDY_CONTAINER" "$dir"
+  caddy_net_prepare
   dc "$dir" up -d
 }
 
@@ -2193,6 +2356,7 @@ caddy_upgrade_format() {
   caddy_write_all
   dc "$dir" config >/dev/null || die "docker compose config: ошибка в $(caddy_compose)"
   ensure_container_name_free "$CADDY_CONTAINER" "$dir"
+  caddy_net_prepare
   dc "$dir" up -d --force-recreate
   say "Готово: сертификаты и домены сохранены."
 }
@@ -2654,8 +2818,10 @@ caddy_install() {
   dc "$dir" config >/dev/null || die "docker compose config: проверьте синтаксис YAML ($compose)."
   ensure_container_name_free "$CADDY_CONTAINER" "$dir"
   say "Запуск Caddy (образ $CADDY_IMAGE)…"
+  caddy_net_prepare
   dc "$dir" up -d --force-recreate
   CADDY_ENV_CHANGED=0
+  caddy_net_connect_proxies
 
   local failed=0 doms=()
   load_caddy_domains
@@ -2698,6 +2864,18 @@ caddy_uninstall() {
     return 0
   }
   dc "$dir" down || warn "не удалось остановить Caddy (продолжаю)."
+  local apps_now
+  apps_now="$(apps_list)"
+  if [[ -n "$apps_now" ]]; then
+    warn "без Caddy Docker-приложения сайтов ($(apps_dir)) снаружи не открываются."
+    if prompt_yes_no "Остановить их? (файлы и данные останутся; удалить — Сайты → Docker-приложения)" y; then
+      local ad
+      while IFS= read -r ad; do
+        [[ -n "$ad" ]] || continue
+        soft_step "не удалось остановить приложение $ad." app_dc "$ad" stop
+      done <<<"$apps_now"
+    fi
+  fi
   if prompt_yes_no "Удалить Docker-образ Caddy ($CADDY_IMAGE)?" "$DEFAULT_DELETE_IMAGE_ON_UNINSTALL"; then
     docker image rm "$CADDY_IMAGE" >/dev/null 2>&1 && say "Образ $CADDY_IMAGE удалён." || warn "образ $CADDY_IMAGE не удалён (используется или уже удалён)."
   fi
@@ -2860,6 +3038,11 @@ caddy_remove_domain_flow() {
       site_rm_files "$d"
     fi
   fi
+  if [[ "$site" == docker:* ]] && app_installed "$d"; then
+    if prompt_yes_no "Остановить и удалить Docker-приложение ($(app_dir "$d"))?" y; then
+      app_remove "$d"
+    fi
+  fi
   say "Домен $d удалён из Caddy."
 }
 
@@ -2981,7 +3164,9 @@ caddy_start() {
   require_caddy
   require_docker
   ensure_container_name_free "$CADDY_CONTAINER" "$(caddy_dir)"
+  caddy_net_prepare
   dc "$(caddy_dir)" up -d
+  caddy_net_connect_proxies
 }
 
 caddy_stop() {
@@ -3004,6 +3189,7 @@ caddy_update() {
   dir="$(caddy_dir)"
   say "Скачиваю новый образ Caddy ($CADDY_IMAGE)…"
   dc "$dir" pull
+  caddy_net_prepare
   dc "$dir" up -d
   if prompt_yes_no "Удалить старые неиспользуемые образы (docker image prune -f)?" "$DEFAULT_PRUNE_IMAGES"; then
     docker image prune -f
@@ -3015,14 +3201,12 @@ caddy_update() {
 # Caddy: сайты (статические, из репозитория или своя папка)
 # =============================================================================
 
-# Скачать архив репозитория и выбрать сайт из $SITES_PATH. $1 — имя по умолчанию.
-# Результат: SITE_SRC_DIR, SITE_NAME, SITE_TMP (временный каталог — удалить после копирования).
-site_fetch_repo() {
-  local cur="${1:-}" url tmp root base x i n choice def=1
-  local names=()
-  SITE_SRC_DIR=""
-  SITE_NAME=""
-  SITE_TMP=""
+# Скачать и распаковать архив репозитория $SITES_REPO.
+# Результат: REPO_TMP (временный каталог — удалить после использования), REPO_ROOT (корень репозитория).
+repo_download() {
+  local url tmp root
+  REPO_TMP=""
+  REPO_ROOT=""
   url="https://codeload.github.com/${SITES_REPO}/tar.gz/refs/heads/${SITES_BRANCH}"
   tmp="$(mktemp -d)" || die "mktemp не сработал"
   say "Скачиваю ${SITES_REPO} (ветка ${SITES_BRANCH})…"
@@ -3045,20 +3229,50 @@ site_fetch_repo() {
     die "Не удалось распаковать архив репозитория."
   }
   root="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+  if [[ -z "$root" ]]; then
+    rm -rf "$tmp"
+    die "Архив репозитория пустой."
+  fi
+  REPO_TMP="$tmp"
+  REPO_ROOT="$root"
+}
+
+# Скачать архив репозитория и выбрать сайт из $SITES_PATH (или из $SITES_LEGACY_PATH, если $SITES_PATH нет).
+# $1 — имя по умолчанию. Результат: SITE_SRC_DIR, SITE_NAME, SITE_TMP (временный каталог — удалить после копирования).
+site_fetch_repo() {
+  local cur="${1:-}" tmp root base x nm i n choice def=1 legacy=0
+  local names=()
+  SITE_SRC_DIR=""
+  SITE_NAME=""
+  SITE_TMP=""
+  repo_download
+  tmp="$REPO_TMP"
+  root="$REPO_ROOT"
   base="$root/$SITES_PATH"
-  if [[ -z "$root" || ! -d "$base" ]]; then
+  if [[ ! -d "$base" ]]; then
+    base="$root/$SITES_LEGACY_PATH"
+    legacy=1
+  fi
+  if [[ ! -d "$base" ]]; then
     rm -rf "$tmp"
     die "В репозитории нет папки $SITES_PATH/."
+  fi
+  if ((legacy)); then
+    warn "в репозитории нет папки $SITES_PATH/ — беру сайты из $SITES_LEGACY_PATH/ (старая раскладка)."
   fi
   for x in "$base"/*/; do
     [[ -d "$x" ]] || continue
     x="${x%/}"
-    names+=("$(basename "$x")")
+    nm="$(basename "$x")"
+    if ((legacy)) && [[ "$nm" == "static" || "$nm" == "docker" ]]; then
+      continue
+    fi
+    names+=("$nm")
   done
   n=${#names[@]}
   if ((n == 0)); then
     rm -rf "$tmp"
-    die "В $SITES_REPO/$SITES_PATH/ нет папок с сайтами."
+    die "В $SITES_REPO/${base#"$root"/}/ нет папок с сайтами."
   fi
   say "Сайты в репозитории:"
   for ((i = 0; i < n; i++)); do
@@ -3301,9 +3515,33 @@ EOF2
 }
 
 # Проверить, что сайт открывается (локально, с SNI домена).
+# Код ответа при проверке: статика — только 200; прокси / приложение — любой, кроме 5xx и «нет ответа».
+site_code_ok() {
+  local code="$1" s="$2"
+  [[ "$code" == "200" ]] && return 0
+  site_is_proxy "$s" && [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]
+}
+
+site_code_report() {
+  local code="$1" s="$2" what="$3"
+  if site_code_ok "$code" "$s"; then
+    if [[ "$code" == "200" ]]; then
+      say "Проверка: $what отвечает 200 OK."
+    else
+      say "Проверка: $what отвечает (код $code — ответ приложения)."
+    fi
+  else
+    warn "проверка $what вернула код «${code:-нет ответа}»."
+  fi
+}
+
 site_verify() {
-  local d="$1" l="${2:-443}" p code
+  local d="$1" l="${2:-443}" p code s="" up="-" tries
   p="$(site_check_port "$l")"
+  if caddy_has_domain "$d"; then
+    s="${CADDY_SITES[$CADDY_IDX]}"
+    up="${CADDY_UPS[$CADDY_IDX]:--}"
+  fi
   if ! caddy_wait_cert "$d"; then
     caddy_failure_hints "$d"
     warn "сайт заработает, когда Caddy получит сертификат."
@@ -3311,19 +3549,25 @@ site_verify() {
   fi
   sleep 2
   if command -v curl >/dev/null 2>&1; then
-    code="$(curl -sk --max-time 10 --resolve "$d:$p:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$d:$p/" 2>/dev/null || true)"
-    if [[ "$code" == "200" ]]; then
-      say "Проверка: https://$d:$p/ через 127.0.0.1 отвечает 200 OK."
-    else
-      warn "проверка https://$d:$p/ через 127.0.0.1 вернула код «${code:-нет ответа}»."
+    tries=1
+    if site_is_proxy "$s"; then tries=12; fi
+    while true; do
+      code="$(curl -sk --max-time 10 --resolve "$d:$p:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$d:$p/" 2>/dev/null || true)"
+      tries=$((tries - 1))
+      if site_code_ok "$code" "$s" || ((tries <= 0)); then break; fi
+      if [[ "$tries" == "11" ]]; then say "Жду ответа приложения (до минуты)…"; fi
+      sleep 5
+    done
+    site_code_report "$code" "$s" "https://$d:$p/ через 127.0.0.1"
+    if site_is_proxy "$s" && ! site_code_ok "$code" "$s"; then
+      say "  Caddy не достучался до цели: $(up_desc "$up")."
+      if [[ "$s" == docker:* ]]; then
+        say "  Приложению может требоваться время на первый запуск. Логи: Caddy → Сайты → Docker-приложения → Логи."
+      fi
     fi
     if [[ "$l" == "443" ]] && haproxy_forwards_to_caddy && container_running "$HAPROXY_CONTAINER"; then
       code="$(curl -sk --max-time 10 --resolve "$d:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$d/" 2>/dev/null || true)"
-      if [[ "$code" == "200" ]]; then
-        say "Проверка: https://$d/ через HAProxy (127.0.0.1:443) отвечает 200 OK."
-      else
-        warn "проверка https://$d/ через HAProxy (127.0.0.1:443) вернула код «${code:-нет ответа}»."
-      fi
+      site_code_report "$code" "$s" "https://$d/ через HAProxy (127.0.0.1:443)"
     fi
   fi
   say "Адрес: $(site_url "$d" "$l")"
@@ -3347,13 +3591,17 @@ site_rm_files() {
 
 caddy_sites_show() {
   require_caddy
-  local i n found=0
+  local i n found=0 s desc
   load_caddy_domains
   n=${#CADDY_DOMAINS[@]}
-  say "Сайты (файлы: $(caddy_www_dir)/<домен>/, репозиторий: $SITES_REPO/$SITES_PATH):"
+  say "Сайты (файлы: $(caddy_www_dir)/<домен>/, приложения: $(apps_dir)/<домен>/, репозиторий: $SITES_REPO/www):"
   for ((i = 0; i < n; i++)); do
-    if [[ "${CADDY_SITES[i]}" != "-" ]]; then
-      printf '  %s — %s — %s\n' "${CADDY_DOMAINS[i]}" "${CADDY_SITES[i]}" "$(site_url "${CADDY_DOMAINS[i]}" "${CADDY_LISTENS[i]}")" >&2
+    s="${CADDY_SITES[i]}"
+    if [[ "$s" != "-" ]]; then
+      desc="$s"
+      if site_is_proxy "$s"; then desc="$s → $(up_desc "${CADDY_UPS[i]:--}")"; fi
+      if [[ "$s" == docker:* ]]; then desc="$desc [$(app_state_short "${CADDY_DOMAINS[i]}")]"; fi
+      printf '  %s — %s — %s\n' "${CADDY_DOMAINS[i]}" "$desc" "$(site_url "${CADDY_DOMAINS[i]}" "${CADDY_LISTENS[i]}")" >&2
       found=1
     fi
   done
@@ -3364,7 +3612,7 @@ caddy_sites_show() {
 
 # Добавить или изменить сайт на домене.
 caddy_site_set() {
-  local d="${1:-}" choice kind src cur="" listen tmp=""
+  local d="${1:-}" choice kind="" src="" cur="" listen tmp="" up="-" old_up def=1
   require_caddy
   require_docker
   if [[ -z "$d" ]]; then
@@ -3391,15 +3639,25 @@ caddy_site_set() {
   caddy_has_domain "$d" || die "Домена $d нет в Caddy."
   cur="${CADDY_SITES[$CADDY_IDX]}"
   listen="${CADDY_LISTENS[$CADDY_IDX]}"
+  old_up="${CADDY_UPS[$CADDY_IDX]:--}"
   if [[ "$cur" == "-" ]]; then
     say "Сайт для $d: сейчас нет."
+  elif site_is_proxy "$cur"; then
+    say "Сайт для $d: сейчас $cur → $old_up, $(site_listen_desc "$listen") (порт меняется в «Сайты → Порт / доступ»)."
   else
     say "Сайт для $d: сейчас $cur, $(site_listen_desc "$listen") (порт меняется в «Сайты → Порт / доступ»)."
   fi
+  case "$cur" in
+    own) def=2 ;;
+    proxy) def=3 ;;
+    docker:*) def=4 ;;
+  esac
   say "  1) скачать из репозитория $SITES_REPO ($SITES_PATH/)"
   say "  2) свой сайт — указать папку на сервере"
+  say "  3) прокси на адрес — 127.0.0.1:ПОРТ, контейнер:ПОРТ или https://…"
+  say "  4) Docker-приложение из репозитория ($SITES_DOCKER_PATH/) — скачать, запустить и подключить"
   say "  0) отмена"
-  choice="$(ask_value "Источник" "1")"
+  choice="$(ask_value "Источник" "$def")"
   case "$choice" in
     1)
       site_fetch_repo "${cur#repo:}" || {
@@ -3418,18 +3676,59 @@ caddy_site_set() {
       src="$SITE_SRC_DIR"
       kind="own"
       ;;
+    3)
+      local cur_up=""
+      if [[ "$cur" == "proxy" && "$old_up" != "-" ]]; then cur_up="$old_up"; fi
+      site_ask_proxy "$d" "$cur_up" || {
+        say "Отмена."
+        return 0
+      }
+      kind="proxy"
+      up="$SITE_UP"
+      ;;
+    4)
+      kind="docker"
+      ;;
     *)
       say "Отмена."
       return 0
       ;;
   esac
 
+  caddy_site_finish "$d" "$cur" "$kind" "$src" "$tmp" "$up" "$listen"
+}
+
+# Общий конец «Добавить / изменить сайт». $3: repo:имя | own | proxy | docker (приложение ставится здесь).
+caddy_site_finish() {
+  local d="$1" cur="$2" kind="$3" src="$4" tmp="$5" up="$6" listen="$7"
   if [[ "$cur" == "-" ]]; then
     site_ask_listen "$d" ""
     listen="$SITE_LISTEN"
   fi
 
-  site_install_files "$d" "$src"
+  if [[ "$kind" == "docker" ]]; then
+    app_install "$d" || {
+      say "Отмена."
+      return 0
+    }
+    kind="docker:$SITE_NAME"
+    up="$SITE_UP"
+  elif [[ "$cur" == docker:* ]] && app_installed "$d"; then
+    if prompt_yes_no "Раньше здесь было Docker-приложение ($cur). Остановить и удалить его?" y; then
+      app_remove "$d"
+    fi
+  fi
+
+  if site_is_proxy "$kind"; then
+    if [[ ( "$cur" == repo:* || "$cur" == "own" ) && -d "$(caddy_www_dir)/$d" ]]; then
+      if prompt_yes_no "Удалить файлы прежнего сайта $(caddy_www_dir)/$d?" "$DEFAULT_DELETE_SITE_FILES"; then
+        site_rm_files "$d"
+      fi
+    fi
+  else
+    site_install_files "$d" "$src"
+    up="-"
+  fi
   if [[ -n "$tmp" ]]; then rm -rf "$tmp"; fi
 
   caddy_snapshot
@@ -3437,14 +3736,51 @@ caddy_site_set() {
   caddy_find "$d"
   CADDY_SITES[CADDY_IDX]="$kind"
   CADDY_LISTENS[CADDY_IDX]="$listen"
+  CADDY_UPS[CADDY_IDX]="$up"
   save_caddy_domains
   if ! caddy_commit; then
     caddy_restore_snapshot
+    if site_is_proxy "$kind"; then
+      die "Сайт не включён: нужные порты заняты."
+    fi
     die "Сайт не включён: нужные порты заняты (файлы оставлены в $(caddy_www_dir)/$d)."
   fi
   caddy_drop_snapshot
-  say "Сайт на $d: $kind, $(site_listen_desc "$listen")"
+  if site_is_proxy "$kind"; then
+    say "Сайт на $d: $kind → $(up_desc "$up"), $(site_listen_desc "$listen")"
+  else
+    say "Сайт на $d: $kind, $(site_listen_desc "$listen")"
+  fi
   site_verify "$d" "$listen"
+}
+
+# Сайт-прокси из командной строки: caddy site proxy [домен] [адрес].
+caddy_site_proxy() {
+  local d="${1:-}" target="${2:-}" cur listen old_up cur_up=""
+  if [[ -z "$d" ]]; then
+    caddy_site_set
+    return
+  fi
+  require_caddy
+  require_docker
+  d="$(normalize_domain "$d")"
+  if ! caddy_has_domain "$d"; then
+    prompt_yes_no "Домена $d нет в Caddy. Добавить?" y || {
+      say "Отмена."
+      return 0
+    }
+    caddy_add_domain_flow "$d" || return 1
+    caddy_has_domain "$d" || die "Домена $d нет в Caddy."
+  fi
+  cur="${CADDY_SITES[$CADDY_IDX]}"
+  listen="${CADDY_LISTENS[$CADDY_IDX]}"
+  old_up="${CADDY_UPS[$CADDY_IDX]:--}"
+  if [[ "$cur" == "proxy" && "$old_up" != "-" ]]; then cur_up="$old_up"; fi
+  site_ask_proxy "$d" "$cur_up" "$target" || {
+    say "Отмена."
+    return 0
+  }
+  caddy_site_finish "$d" "$cur" proxy "" "" "$SITE_UP" "$listen"
 }
 
 # Сменить, где открывается сайт: 443 / свой порт / локально (Reality selfsteal).
@@ -3561,18 +3897,1102 @@ caddy_site_remove() {
   fi
   caddy_has_domain "$d" || die "Домена $d нет в Caddy."
   [[ "${CADDY_SITES[$CADDY_IDX]}" != "-" ]] || die "На $d нет сайта."
+  local old_site="${CADDY_SITES[$CADDY_IDX]}"
   prompt_yes_no "Отключить сайт на $d? Домен и сертификат останутся." y || {
     say "Отмена."
     return 0
   }
   CADDY_SITES[CADDY_IDX]="-"
   CADDY_LISTENS[CADDY_IDX]="-"
+  CADDY_UPS[CADDY_IDX]="-"
   save_caddy_domains
   caddy_commit || warn "не удалось применить конфигурацию Caddy."
+  if [[ "$old_site" == docker:* ]] && app_installed "$d"; then
+    if prompt_yes_no "Остановить и удалить Docker-приложение ($(app_dir "$d"))?" y; then
+      app_remove "$d"
+    else
+      say "Приложение оставлено: Caddy → Сайты → Docker-приложения."
+    fi
+  fi
   if [[ -d "$(caddy_www_dir)/$d" ]] && prompt_yes_no "Удалить файлы сайта $(caddy_www_dir)/$d?" "$DEFAULT_DELETE_SITE_FILES"; then
     site_rm_files "$d"
   fi
   say "Сайт на $d отключён."
+}
+
+# =============================================================================
+# Caddy: сайты-прокси (адрес / контейнер) и Docker-приложения из репозитория
+# =============================================================================
+
+# Адрес docker-хоста (шлюз сети bridge, обычно 172.17.0.1) — куда указывает host.docker.internal.
+docker_host_ip() {
+  local ip=""
+  if command -v docker >/dev/null 2>&1; then
+    ip="$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip="$DOCKER_HOST_BIND_DEFAULT"
+  echo "$ip"
+}
+
+# Какой контейнер опубликовал порт хоста $1: «имя порт_в_контейнере» (пусто — никакой).
+docker_publisher_of() {
+  local p="$1"
+  command -v docker >/dev/null 2>&1 || return 0
+  docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | awk -F'\t' -v p="$p" '
+    {
+      n = split($2, a, /, /)
+      for (i = 1; i <= n; i++) {
+        if (a[i] ~ (":" p "->")) {
+          x = a[i]
+          sub(/.*->/, "", x)
+          sub(/\/.*/, "", x)
+          print $1, x
+          exit
+        }
+      }
+    }' || true
+}
+
+# Где на хосте слушается TCP-порт $1: all (0.0.0.0 / :: / *) | local (только 127.0.0.1 / ::1) | other | none.
+host_listen_scope() {
+  local p="$1" a addr any=0 loc=0 oth=0
+  while IFS= read -r a; do
+    [[ -n "$a" && "${a##*:}" == "$p" ]] || continue
+    addr="${a%:*}"
+    case "$addr" in
+      127.* | "[::1]" | ::1) loc=1 ;;
+      0.0.0.0 | "*" | "[::]" | "::" | "[::]%"*) any=1 ;;
+      *) oth=1 ;;
+    esac
+  done <<<"$(tcp_listen_list)"
+  if ((any)); then
+    echo all
+  elif ((oth)); then
+    echo other
+  elif ((loc)); then
+    echo local
+  else
+    echo none
+  fi
+}
+
+# Фаервол включён — предложить пустить контейнеры (Caddy) к сервису на хосте. Снаружи порт остаётся закрытым.
+site_fw_allow_docker() {
+  local p="$1"
+  is_linux || return 0
+  [[ "$(fw_backend)" != "none" ]] || return 0
+  fw_active || return 0
+  say "Фаервол включён: он может не пускать контейнер Caddy к сервису на хосте (порт $p)."
+  if prompt_yes_no "Разрешить $p/tcp из подсетей Docker ($DOCKER_SUBNETS)? Снаружи порт останется закрытым." y; then
+    soft_step "не удалось добавить правило для $p/tcp." fw_allow "$p/tcp" "$DOCKER_SUBNETS" "remnanode.sh docker-to-host"
+    soft_step "не удалось перезагрузить правила фаервола." fw_reload
+  fi
+}
+
+# Порт $1 — один из портов самого Caddy (прокси сам на себя)?
+caddy_owns_port() {
+  local p="$1" spec
+  [[ "$p" == "80" || "$p" == "$CADDY_HTTPS_HOST_PORT" ]] && return 0
+  if [[ "$p" == "443" ]] && haproxy_forwards_to_caddy; then return 0; fi
+  for spec in $(caddy_compose_specs); do
+    [[ "$(spec_host_port "$spec")" == "$p" ]] && return 0
+  done
+  return 1
+}
+
+# Спросить, куда проксировать сайт. $2 — текущее значение (Enter — оставить), $3 — значение без вопроса (CLI).
+# Результат: SITE_UP. return 1 — отмена.
+site_ask_proxy() {
+  local d="$1" cur="${2:-}" preset="${3:-}" v h k p pub cp first=1 hint="Enter — отмена"
+  SITE_UP=""
+  if [[ -z "$preset" ]]; then
+    say "Куда проксировать сайт $d (Caddy примет HTTPS и передаст запросы туда):"
+    say "  127.0.0.1:8080  — сервис на этом сервере (Caddy пойдёт через host.docker.internal)"
+    say "  контейнер:порт  — Docker-контейнер, например nextcloud:80 (будет подключён к сети $WEB_NETWORK)"
+    say "  https://адрес   — другой сервер / внешний сайт (http:// тоже можно; без пути)"
+  fi
+  if [[ -n "$cur" ]]; then hint="Enter — оставить"; fi
+  while true; do
+    if ((first)) && [[ -n "$preset" ]]; then
+      v="$preset"
+    else
+      v="$(ask_value "Адрес ($hint)" "$cur")"
+      [[ -n "$v" ]] || return 1
+    fi
+    first=0
+    v="$(trim "$v")"
+    v="${v%/}"
+    if [[ -z "$v" || "$v" == *[[:space:]]* || "$v" == *"#"* ]]; then
+      warn "адрес не должен быть пустым и содержать пробелы или #."
+      continue
+    fi
+    case "$v" in
+      http://* | https://*)
+        h="${v#*://}"
+        if [[ -z "$h" || "$h" == */* || "$h" == *\?* ]]; then
+          warn "у адреса не должно быть пути: только схема://хост[:порт]."
+          continue
+        fi
+        SITE_UP="$v"
+        return 0
+        ;;
+    esac
+    if [[ ! "$v" =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || ! valid_port "$(up_port "$v")"; then
+      warn "ожидается ХОСТ:ПОРТ (127.0.0.1:8080, nextcloud:80) или http(s)://адрес."
+      continue
+    fi
+    if [[ "$(lower "$(up_host "$v")")" == "localhost" ]]; then v="127.0.0.1:$(up_port "$v")"; fi
+    k="$(up_kind "$v")"
+    p="$(up_port "$v")"
+    case "$k" in
+      host)
+        if caddy_owns_port "$p"; then
+          warn "порт $p — это сам Caddy, так нельзя (получится петля)."
+          continue
+        fi
+        pub="$(docker_publisher_of "$p")"
+        if [[ -n "$pub" ]]; then
+          h="${pub%% *}"
+          cp="${pub#* }"
+          if [[ "$h" == "$CADDY_CONTAINER" ]]; then
+            warn "порт $p — это сам Caddy, так нельзя (получится петля)."
+            continue
+          fi
+          say "Порт $p опубликован Docker-контейнером $h (порт в контейнере: $cp)."
+          if prompt_yes_no "Подключить Caddy к $h:$cp напрямую через сеть Docker? (надёжнее: не важно, на каком адресе опубликован порт)" y; then
+            SITE_UP="$h:$cp"
+            return 0
+          fi
+        fi
+        case "$(host_listen_scope "$p")" in
+          none)
+            warn "на порту $p сейчас ничего не слушает — сайт будет отвечать 502, пока сервис не запустится."
+            ;;
+          local)
+            if [[ -n "$pub" ]]; then
+              warn "порт $p опубликован только на 127.0.0.1 — из контейнера Caddy он недоступен (выберите подключение через сеть Docker)."
+            else
+              warn "порт $p слушается только на 127.0.0.1 — из контейнера Caddy он недоступен."
+              say "  Сделайте, чтобы сервис слушал 0.0.0.0:$p или $(docker_host_ip):$p (адрес docker-хоста, снаружи не виден)."
+            fi
+            prompt_yes_no "Всё равно сохранить $v?" n || continue
+            ;;
+        esac
+        if [[ -z "$pub" ]]; then site_fw_allow_docker "$p"; fi
+        ;;
+      net)
+        h="$(up_host "$v")"
+        if [[ "$h" == "$CADDY_CONTAINER" ]]; then
+          warn "это сам Caddy, так нельзя."
+          continue
+        fi
+        if ! docker container inspect "$h" >/dev/null 2>&1; then
+          warn "контейнера «$h» сейчас нет."
+          prompt_yes_no "Всё равно сохранить? (Caddy будет отвечать 502, пока контейнер не появится)" n || continue
+        elif [[ "$(docker container inspect -f '{{.HostConfig.NetworkMode}}' "$h" 2>/dev/null || true)" == "host" ]]; then
+          warn "контейнер $h работает в network_mode: host — укажите 127.0.0.1:$p."
+          continue
+        fi
+        ;;
+    esac
+    SITE_UP="$v"
+    return 0
+  done
+}
+
+# --- Docker-приложения: ~/remnanode/apps/<домен>/ ---
+
+app_slug() { local d="$1"; echo "${d//./-}"; }
+app_dir() { echo "$(apps_dir)/$1"; }
+app_project() { echo "${APP_PROJECT_PREFIX}-$(app_slug "$1")"; }
+app_alias() { echo "app-$(app_slug "$1")"; }
+app_meta() { echo "$(app_dir "$1")/$APP_META_FILE"; }
+app_installed() { [[ -f "$(app_meta "$1")" ]]; }
+
+# Домены установленных приложений — по одному на строку.
+apps_list() {
+  local x
+  for x in "$(apps_dir)"/*/; do
+    [[ -f "$x$APP_META_FILE" ]] || continue
+    x="${x%/}"
+    basename "$x"
+  done
+}
+
+# Файл compose в каталоге (имя файла; пусто — нет).
+app_find_compose() {
+  local f
+  for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    if [[ -f "$1/$f" ]]; then
+      echo "$f"
+      return 0
+    fi
+  done
+}
+
+app_reset_vars() {
+  APP_TEMPLATE=""
+  APP_COMPOSE=""
+  APP_SERVICE=""
+  APP_CPORT=""
+  APP_HPORT=""
+  APP_MODE=""
+  APP_VIA=""
+  APP_HOSTIP=""
+  APP_RENAME=0
+}
+
+# Настройки приложения домена $1 → APP_*. return 1 — не установлено.
+app_load() {
+  local f k v
+  app_reset_vars
+  f="$(app_meta "$1")"
+  [[ -f "$f" ]] || return 1
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
+    case "$k" in
+      TEMPLATE) APP_TEMPLATE="$v" ;;
+      COMPOSE) APP_COMPOSE="$v" ;;
+      SERVICE) APP_SERVICE="$v" ;;
+      CPORT) APP_CPORT="$v" ;;
+      HPORT) APP_HPORT="$v" ;;
+      MODE) APP_MODE="$v" ;;
+      VIA) APP_VIA="$v" ;;
+      HOSTIP) APP_HOSTIP="$v" ;;
+      RENAME) APP_RENAME="${v:-0}" ;;
+    esac
+  done <"$f"
+  [[ -n "$APP_COMPOSE" ]] || APP_COMPOSE="docker-compose.yml"
+  return 0
+}
+
+app_save() {
+  local d="$1"
+  mkdir -p "$(app_dir "$d")" || die "Не удалось создать $(app_dir "$d")"
+  write_lines "$(app_meta "$d")" \
+    "# ${SCRIPT_NAME}: настройки Docker-приложения для $d — меняйте через скрипт (Сайты → Docker-приложения)" \
+    "TEMPLATE=$APP_TEMPLATE" \
+    "COMPOSE=$APP_COMPOSE" \
+    "SERVICE=$APP_SERVICE" \
+    "CPORT=$APP_CPORT" \
+    "HPORT=$APP_HPORT" \
+    "MODE=$APP_MODE" \
+    "VIA=$APP_VIA" \
+    "HOSTIP=$APP_HOSTIP" \
+    "RENAME=$APP_RENAME"
+}
+
+# docker compose приложения: свой проект, compose + override шаблона (если есть) + подключение к сети Caddy.
+app_dc() {
+  local d="$1" dir comp f
+  shift
+  dir="$(app_dir "$d")"
+  comp="$(sed -n 's/^COMPOSE=//p' "$(app_meta "$d")" 2>/dev/null | head -n1 || true)"
+  [[ -n "$comp" ]] || comp="docker-compose.yml"
+  local args=(compose -p "$(app_project "$d")" --project-directory "$dir" -f "$dir/$comp")
+  for f in docker-compose.override.yml docker-compose.override.yaml compose.override.yml compose.override.yaml; do
+    if [[ -f "$dir/$f" ]]; then args+=(-f "$dir/$f"); fi
+  done
+  if [[ -f "$dir/$APP_OVERRIDE_FILE" ]]; then args+=(-f "$dir/$APP_OVERRIDE_FILE"); fi
+  docker "${args[@]}" "$@"
+}
+
+# Разбор compose (простой YAML): строки «тип|сервис|…»:
+#   S|сервис  K|сервис|строка_ports  P|сервис|строка|значение  L|сервис|строка (длинный формат порта)
+#   C|сервис|container_name  N|сервис|network_mode
+app_compose_scan() {
+  awk -v q="'" '
+    function ind(s) { match(s, /^ */); return RLENGTH }
+    function val(x) {
+      sub(/[ \t]+#.*$/, "", x)
+      gsub("^[ \t\"" q "]+|[ \t\"" q "]+$", "", x)
+      return x
+    }
+    {
+      raw = $0
+      sub(/\r$/, "", raw)
+      if (raw ~ /^[ \t]*(#.*)?$/) next
+      i = ind(raw)
+      line = substr(raw, i + 1)
+      if (i == 0) {
+        insvc = (line ~ /^services:[ \t]*(#.*)?$/)
+        svcind = -1
+        svc = ""
+        next
+      }
+      if (!insvc) next
+      if (svcind < 0) svcind = i
+      if (i <= svcind) {
+        if (i == svcind) {
+          svc = line
+          sub(/:.*/, "", svc)
+          keyind = -1
+          inports = 0
+          print "S|" svc
+        }
+        next
+      }
+      if (svc == "") next
+      if (keyind < 0) keyind = i
+      if (i == keyind) {
+        inports = 0
+        if (line ~ /^ports:/) {
+          inports = 1
+          print "K|" svc "|" NR
+        } else if (line ~ /^container_name:/) {
+          x = line
+          sub(/^container_name:/, "", x)
+          print "C|" svc "|" val(x)
+        } else if (line ~ /^network_mode:/) {
+          x = line
+          sub(/^network_mode:/, "", x)
+          print "N|" svc "|" val(x)
+        }
+        next
+      }
+      if (inports && line ~ /^- /) {
+        x = substr(line, 3)
+        if (x ~ /^[ \t]*(target|published|host_ip|protocol|mode|name|app_protocol):/) print "L|" svc "|" NR
+        else print "P|" svc "|" NR "|" val(x)
+      }
+    }' "$1"
+}
+
+# Разобрать короткий формат порта: «80», «8080:80», «127.0.0.1:8080:80» (+ /tcp). Результат: PS_IP, PS_HP, PS_CP.
+port_spec_parse() {
+  local x="$1" a="" b="" c=""
+  PS_IP=""
+  PS_HP=""
+  PS_CP=""
+  x="${x%/tcp}"
+  [[ "$x" != */* && "$x" != *\[* && "$x" != *'$'* ]] || return 1
+  IFS=: read -r a b c <<<"$x"
+  if [[ -n "$c" ]]; then
+    PS_IP="$a"
+    PS_HP="$b"
+    PS_CP="$c"
+  elif [[ -n "$b" ]]; then
+    PS_HP="$a"
+    PS_CP="$b"
+  else
+    PS_CP="$a"
+  fi
+  valid_port "$PS_CP" || return 1
+  [[ -z "$PS_HP" ]] || valid_port "$PS_HP" || return 1
+  return 0
+}
+
+# По compose-шаблону ($1): порт сервиса APP_SERVICE с портом в контейнере APP_CPORT.
+# Результат: APP_PL (номер строки, 0 — нет), APP_PK (строка «ports:»), APP_PN (элементов в ports),
+# APP_TPL_IP, APP_TPL_HP (как в шаблоне), APP_NETMODE, APP_CNAMES (все container_name через пробел).
+app_scan_orig() {
+  local f="$1" scan t svc a b
+  APP_PL=0
+  APP_PK=0
+  APP_PN=0
+  APP_TPL_IP=""
+  APP_TPL_HP=""
+  APP_NETMODE=""
+  APP_CNAMES=""
+  scan="$(app_compose_scan "$f")"
+  while IFS='|' read -r t svc a b; do
+    [[ -n "$t" ]] || continue
+    if [[ "$t" == "C" ]]; then APP_CNAMES+="$a "; fi
+    [[ "$svc" == "$APP_SERVICE" ]] || continue
+    case "$t" in
+      K) APP_PK="$a" ;;
+      L) APP_PN=$((APP_PN + 1)) ;;
+      N) APP_NETMODE="$a" ;;
+      P)
+        APP_PN=$((APP_PN + 1))
+        if ((APP_PL == 0)) && port_spec_parse "$b" && [[ "$PS_CP" == "$APP_CPORT" ]]; then
+          APP_PL="$a"
+          APP_TPL_IP="$PS_IP"
+          APP_TPL_HP="$PS_HP"
+        fi
+        ;;
+    esac
+  done <<<"$scan"
+}
+
+# Выбрать веб-сервис и его порт в контейнере по compose-шаблону ($1). Результат: APP_SERVICE, APP_CPORT.
+app_detect() {
+  local f="$1" scan t svc a b i n choice pick
+  local svcs=() cands=()
+  scan="$(app_compose_scan "$f")"
+  while IFS='|' read -r t svc a b; do
+    case "$t" in
+      S) svcs+=("$svc") ;;
+      P)
+        if port_spec_parse "$b"; then cands+=("$svc|$PS_CP|$b"); fi
+        ;;
+    esac
+  done <<<"$scan"
+  ((${#svcs[@]} > 0)) || die "В $f не найден раздел services:."
+  n=${#cands[@]}
+  if ((n > 0)); then
+    pick=0
+    if ((n > 1)); then
+      say "Порты в шаблоне:"
+      for ((i = 0; i < n; i++)); do
+        IFS='|' read -r svc a b <<<"${cands[i]}"
+        say "  $((i + 1))) сервис $svc: \"$b\" (в контейнере: $a)"
+      done
+      while true; do
+        choice="$(ask_value "Какой порт ведёт на сайт (номер)" "1")"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then break; fi
+        warn "введите номер из списка."
+      done
+      pick=$((choice - 1))
+    fi
+    IFS='|' read -r APP_SERVICE APP_CPORT b <<<"${cands[pick]}"
+    say "Сайт: сервис $APP_SERVICE, порт в контейнере $APP_CPORT (в шаблоне: \"$b\")."
+  else
+    say "В шаблоне нет портов в формате «ХОСТ:КОНТЕЙНЕР» — укажите сервис и порт вручную."
+    if ((${#svcs[@]} == 1)); then
+      APP_SERVICE="${svcs[0]}"
+    else
+      for ((i = 0; i < ${#svcs[@]}; i++)); do say "  $((i + 1))) ${svcs[i]}"; done
+      while true; do
+        choice="$(ask_value "Веб-сервис (номер)" "1")"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#svcs[@]}" ]; then break; fi
+        warn "введите номер из списка."
+      done
+      APP_SERVICE="${svcs[$((choice - 1))]}"
+    fi
+    while true; do
+      APP_CPORT="$(ask_value "Порт, который слушает $APP_SERVICE внутри контейнера" "80")"
+      valid_port "$APP_CPORT" && break
+      warn "некорректный порт."
+    done
+  fi
+  app_scan_orig "$f"
+}
+
+# Почему порт хоста нельзя отдать приложению домена $2 (пусто — можно).
+app_port_problem() {
+  local p="$1" d="$2" k i od
+  if ! valid_port "$p"; then
+    echo "некорректный порт «$p»"
+    return
+  fi
+  if [[ "$p" == "80" || "$p" == "443" ]]; then
+    echo "порты 80 и 443 нужны Caddy / HAProxy / Reality — выберите другой"
+    return
+  fi
+  if [[ "$p" == "$CADDY_HTTPS_HOST_PORT" ]]; then
+    echo "порт $p — HTTPS Caddy (${CADDY_HTTPS_BIND}:${p})"
+    return
+  fi
+  if haproxy_listens_on "$p"; then
+    echo "порт $p слушает HAProxy (перенаправление)"
+    return
+  fi
+  for k in node hy2; do
+    if [[ "$(kind_port "$k")" == "$p" ]]; then
+      echo "порт $p — NODE_PORT ($(kind_title "$k"))"
+      return
+    fi
+  done
+  if caddy_installed; then
+    load_caddy_domains
+    for ((i = 0; i < ${#CADDY_DOMAINS[@]}; i++)); do
+      if [[ "${CADDY_LISTENS[i]}" == pub:"$p" || "${CADDY_LISTENS[i]}" == loc:"$p" ]]; then
+        echo "порт $p — сайт ${CADDY_DOMAINS[i]} ($(site_listen_desc "${CADDY_LISTENS[i]}"))"
+        return
+      fi
+    done
+  fi
+  while IFS= read -r od; do
+    [[ -n "$od" && "$od" != "$d" ]] || continue
+    if [[ "$(sed -n 's/^HPORT=//p' "$(app_meta "$od")" | head -n1)" == "$p" ]] && [[ "$(sed -n 's/^MODE=//p' "$(app_meta "$od")" | head -n1)" != "net" ]]; then
+      echo "порт $p уже у приложения $od"
+      return
+    fi
+  done <<<"$(apps_list)"
+  if tcp_port_busy "$p"; then
+    if docker ps --filter "label=com.docker.compose.project=$(app_project "$d")" --format '{{.Ports}}' 2>/dev/null | grep -q ":$p->"; then
+      return
+    fi
+    echo "порт $p уже занят на этом сервере"
+  fi
+}
+
+app_mode_desc() {
+  local d="$1"
+  case "$APP_MODE" in
+    net) echo "порт не публикуется, Caddy → $(app_alias "$d"):$APP_CPORT" ;;
+    loc) echo "127.0.0.1:$APP_HPORT → $APP_CPORT, Caddy → $(app_alias "$d"):$APP_CPORT" ;;
+    dhost) echo "${APP_HOSTIP}:$APP_HPORT → $APP_CPORT (docker-хост), Caddy → host.docker.internal:$APP_HPORT" ;;
+    pub)
+      if [[ "$APP_VIA" == "net" ]]; then
+        echo "0.0.0.0:$APP_HPORT → $APP_CPORT (публично!), Caddy → $(app_alias "$d"):$APP_CPORT"
+      else
+        echo "0.0.0.0:$APP_HPORT → $APP_CPORT (публично!), Caddy → host.docker.internal:$APP_HPORT"
+      fi
+      ;;
+    hostnet) echo "network_mode: host, Caddy → host.docker.internal:$APP_HPORT" ;;
+    *) echo "?" ;;
+  esac
+}
+
+# Адрес приложения для Caddy (поле up= в domains.list).
+app_upstream() {
+  local d="$1"
+  if [[ "$APP_VIA" == "net" ]]; then
+    echo "$(app_alias "$d"):$APP_CPORT"
+  else
+    echo "127.0.0.1:$APP_HPORT"
+  fi
+}
+
+# Спросить, как публиковать порт приложения и как к нему ходит Caddy. Нужны APP_SERVICE, APP_CPORT и app_scan_orig.
+app_ask_mode() {
+  local d="$1" def choice p prob dh spec defp c
+  dh="$(docker_host_ip)"
+  if [[ "$APP_NETMODE" == "host" ]]; then
+    say "Сервис $APP_SERVICE работает в network_mode: host — Caddy подключится через хост (host.docker.internal:$APP_CPORT)."
+    say "  Сервис должен слушать 0.0.0.0:$APP_CPORT или ${dh}:$APP_CPORT."
+    APP_MODE=hostnet
+    APP_VIA=host
+    APP_HPORT="$APP_CPORT"
+    APP_HOSTIP=""
+    site_fw_allow_docker "$APP_HPORT"
+    return 0
+  fi
+  if ((APP_PL == 0)); then
+    say "Порт $APP_CPORT сервиса $APP_SERVICE на хосте не публикуется скриптом — Caddy подключится по сети Docker: $(app_alias "$d"):$APP_CPORT."
+    if ((APP_PN > 0)); then say "  (порты из шаблона в длинном формате оставлены как есть)"; fi
+    APP_MODE=net
+    APP_VIA=net
+    APP_HPORT=""
+    APP_HOSTIP=""
+    return 0
+  fi
+  spec="${APP_TPL_HP:+${APP_TPL_IP:+$APP_TPL_IP:}$APP_TPL_HP:}$APP_CPORT"
+  case "${APP_MODE:-}" in
+    net) def=1 ;;
+    loc) def=2 ;;
+    dhost) def=3 ;;
+    pub) def=4 ;;
+    *)
+      case "$APP_TPL_IP" in
+        127.0.0.1 | localhost) def=2 ;;
+        "$dh") def=3 ;;
+        *) def=1 ;;
+      esac
+      ;;
+  esac
+  say "Как публиковать порт приложения (в шаблоне: \"$spec\"):"
+  say "  1) не публиковать — только сеть Docker; Caddy → $(app_alias "$d"):$APP_CPORT (рекомендую)"
+  say "  2) локально 127.0.0.1:ПОРТ — удобно проверять с сервера; Caddy → по сети Docker"
+  say "  3) на адресе docker-хоста ${dh}:ПОРТ — Caddy → host.docker.internal:ПОРТ; снаружи не виден"
+  say "  4) публично 0.0.0.0:ПОРТ (как «8180:80») — открыт всему интернету без HTTPS (Docker обходит ufw!)"
+  while true; do
+    choice="$(ask_value "Вариант (1/2/3/4)" "$def")"
+    case "$choice" in
+      1)
+        APP_MODE=net
+        APP_VIA=net
+        APP_HPORT=""
+        APP_HOSTIP=""
+        return 0
+        ;;
+      2) APP_MODE=loc ;;
+      3) APP_MODE=dhost ;;
+      4) APP_MODE=pub ;;
+      *)
+        warn "введите 1, 2, 3 или 4."
+        continue
+        ;;
+    esac
+    break
+  done
+  defp="${APP_HPORT:-${APP_TPL_HP:-8080}}"
+  while true; do
+    p="$(ask_value "Порт на хосте" "$defp")"
+    prob="$(app_port_problem "$p" "$d")"
+    [[ -n "$prob" ]] || break
+    warn "$prob"
+  done
+  APP_HPORT="$p"
+  case "$APP_MODE" in
+    loc)
+      APP_VIA=net
+      APP_HOSTIP="127.0.0.1"
+      ;;
+    dhost)
+      APP_VIA=host
+      APP_HOSTIP="$dh"
+      ;;
+    pub)
+      APP_HOSTIP=""
+      warn "порт $p/tcp будет открыт всему интернету без HTTPS — Docker публикует его в обход ufw."
+      say "Как Caddy подключается к приложению:"
+      say "  1) по сети Docker — $(app_alias "$d"):$APP_CPORT (рекомендую)"
+      say "  2) через порт на хосте — host.docker.internal:$p"
+      if [[ "$APP_VIA" == "host" ]]; then def=2; else def=1; fi
+      c="$(ask_value "Вариант (1/2)" "$def")"
+      if [[ "$c" == "2" ]]; then APP_VIA=host; else APP_VIA=net; fi
+      ;;
+  esac
+  return 0
+}
+
+# Сгенерировать compose приложения из <compose>.orig: порт по режиму, при необходимости переименовать контейнеры.
+app_render_compose() {
+  local d="$1" dir src out tmp drop=0 single=0 spec=""
+  dir="$(app_dir "$d")"
+  src="$dir/$APP_COMPOSE.orig"
+  out="$dir/$APP_COMPOSE"
+  [[ -f "$src" ]] || die "Нет $src"
+  app_scan_orig "$src"
+  case "$APP_MODE" in
+    net) drop=1 ;;
+    loc) spec="127.0.0.1:$APP_HPORT:$APP_CPORT" ;;
+    dhost) spec="${APP_HOSTIP:-$(docker_host_ip)}:$APP_HPORT:$APP_CPORT" ;;
+    pub) spec="$APP_HPORT:$APP_CPORT" ;;
+    *) APP_PL=0 ;;
+  esac
+  if [[ "$APP_MODE" =~ ^(loc|dhost|pub)$ ]] && ((APP_PL == 0)); then
+    warn "в шаблоне больше нет порта $APP_CPORT у сервиса $APP_SERVICE — порт не опубликован; смените режим: Docker-приложения → Порт."
+  fi
+  if ((drop && APP_PN == 1)); then single=1; fi
+  tmp="$(mktemp)" || die "mktemp не сработал"
+  awk -v ln="$APP_PL" -v key="$APP_PK" -v drop="$drop" -v single="$single" -v spec="$spec" \
+    -v ren="${APP_RENAME:-0}" -v suf="-$(app_slug "$d")" -v q="'" \
+    -v h1="# ${SCRIPT_NAME}: сгенерировано из $APP_COMPOSE.orig (шаблон $APP_TEMPLATE) — этот файл перезаписывается." \
+    -v h2="# Порт и подключение к Caddy меняйте через скрипт; сам шаблон — в $APP_COMPOSE.orig / в репозитории." '
+    NR == 1 { print h1; print h2 }
+    {
+      line = $0
+      if (ln > 0 && NR == ln) {
+        match(line, /^ */)
+        pre = substr(line, 1, RLENGTH)
+        if (drop) print pre "# (remnanode.sh: порт не публикуется) " substr(line, RLENGTH + 1)
+        else print pre "- \"" spec "\""
+        next
+      }
+      if (ln > 0 && single && NR == key) {
+        sub(/ports:.*/, "ports: []", line)
+        print line
+        next
+      }
+      if (ren && line ~ /^[ ]+container_name:/) {
+        match(line, /^ */)
+        pre = substr(line, 1, RLENGTH)
+        x = line
+        sub(/^[ ]+container_name:[ ]*/, "", x)
+        sub(/[ \t]+#.*$/, "", x)
+        gsub("[\"" q "]", "", x)
+        print pre "container_name: " x suf
+        next
+      }
+      print line
+    }' "$src" >"$tmp" || {
+    rm -f "$tmp"
+    die "Не удалось сгенерировать $out"
+  }
+  mv -f "$tmp" "$out" || die "Не удалось записать $out"
+  chmod 644 "$out" 2>/dev/null || true
+}
+
+# Подключение веб-сервиса к сети Caddy (только если Caddy ходит по сети Docker).
+app_write_override() {
+  local d="$1" f
+  f="$(app_dir "$d")/$APP_OVERRIDE_FILE"
+  if [[ "$APP_VIA" != "net" ]]; then
+    rm -f "$f"
+    return 0
+  fi
+  cat >"$f" <<EOF2
+# ${SCRIPT_NAME}: подключение сервиса ${APP_SERVICE} к сети Caddy (${WEB_NETWORK}) — генерируется, не редактируйте.
+services:
+  ${APP_SERVICE}:
+    networks:
+      default: {}
+      ${WEB_NETWORK}:
+        aliases:
+          - $(app_alias "$d")
+
+networks:
+  ${WEB_NETWORK}:
+    external: true
+    name: ${WEB_NETWORK}
+EOF2
+}
+
+# Применить настройки (APP_* загружены): compose, override, запуск.
+app_apply() {
+  local d="$1" dir
+  dir="$(app_dir "$d")"
+  app_render_compose "$d"
+  app_write_override "$d"
+  if [[ "$APP_VIA" == "net" ]]; then web_net_ensure; fi
+  app_dc "$d" config >/dev/null || die "docker compose config: ошибка в $dir — проверьте $APP_COMPOSE.orig и .env"
+  say "Запускаю приложение $APP_TEMPLATE для $d (первый запуск скачивает образы — может занять время)…"
+  app_dc "$d" up -d --remove-orphans
+}
+
+# Скопировать файлы шаблона в каталог приложения: .env сохраняется, compose шаблона → <compose>.orig.
+app_copy_template() {
+  local src="$1" dir="$2" comp="$3" envbak=""
+  mkdir -p "$dir" || die "Не удалось создать $dir"
+  if [[ -f "$dir/.env" ]]; then
+    envbak="$(mktemp)" || die "mktemp не сработал"
+    cp -p "$dir/.env" "$envbak"
+  fi
+  cp -R "$src/." "$dir/" || die "Не удалось скопировать файлы шаблона в $dir"
+  find "$dir" -maxdepth 3 -name .DS_Store -type f -delete 2>/dev/null || true
+  mv -f "$dir/$comp" "$dir/$comp.orig" || die "Не удалось переименовать $dir/$comp"
+  if [[ -n "$envbak" ]]; then
+    if [[ -f "$dir/.env" ]] && ! cmp -s "$dir/.env" "$envbak"; then
+      mv -f "$dir/.env" "$dir/.env.template"
+      say "Ваш .env сохранён; .env из шаблона — в $dir/.env.template (сравните, если появились новые переменные)."
+    fi
+    mv -f "$envbak" "$dir/.env"
+  elif [[ ! -f "$dir/.env" && -f "$dir/.env.example" ]]; then
+    cp -p "$dir/.env.example" "$dir/.env"
+    say "Создан $dir/.env из .env.example — проверьте значения."
+  fi
+}
+
+# Подставить домен в .env (если там есть DOMAIN=).
+app_env_set_domain() {
+  local d="$1" f
+  f="$(app_dir "$d")/.env"
+  [[ -f "$f" ]] || return 0
+  if grep -q '^DOMAIN=' "$f"; then
+    sed -i "s|^DOMAIN=.*|DOMAIN=${d}|" "$f"
+    say "В $f: DOMAIN=$d"
+  fi
+}
+
+# Занят ли container_name из шаблона чужим контейнером — предложить переименовать (APP_RENAME=1).
+app_check_names() {
+  local d="$1" n proj clash=""
+  APP_RENAME=0
+  for n in $APP_CNAMES; do
+    docker container inspect "$n" >/dev/null 2>&1 || continue
+    proj="$(docker container inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$n" 2>/dev/null || true)"
+    [[ "$proj" != "$(app_project "$d")" ]] || continue
+    clash="$clash $n"
+  done
+  [[ -n "$clash" ]] || return 0
+  warn "контейнеры с такими именами уже есть:$clash (другое приложение / другой домен)."
+  prompt_yes_no "Переименовать контейнеры этого приложения (добавить «-$(app_slug "$d")»)?" y || die "Имена контейнеров заняты — установка невозможна."
+  APP_RENAME=1
+}
+
+# Скачать шаблон из $SITES_DOCKER_PATH. $1 — имя по умолчанию. Результат: SITE_NAME, SITE_SRC_DIR, SITE_TMP.
+app_fetch_template() {
+  local cur="${1:-}" tmp root base x nm i n choice def=1
+  local names=()
+  SITE_NAME=""
+  SITE_SRC_DIR=""
+  SITE_TMP=""
+  repo_download
+  tmp="$REPO_TMP"
+  root="$REPO_ROOT"
+  base="$root/$SITES_DOCKER_PATH"
+  if [[ ! -d "$base" ]]; then
+    rm -rf "$tmp"
+    die "В репозитории нет папки $SITES_DOCKER_PATH/."
+  fi
+  for x in "$base"/*/; do
+    [[ -d "$x" ]] || continue
+    x="${x%/}"
+    nm="$(basename "$x")"
+    [[ -n "$(app_find_compose "$x")" ]] || continue
+    names+=("$nm")
+  done
+  n=${#names[@]}
+  if ((n == 0)); then
+    rm -rf "$tmp"
+    die "В $SITES_REPO/$SITES_DOCKER_PATH/ нет папок с docker-compose.yml."
+  fi
+  say "Docker-приложения в репозитории:"
+  for ((i = 0; i < n; i++)); do
+    if [[ "${names[i]}" == "$cur" ]]; then
+      def=$((i + 1))
+      say "  $((i + 1))) ${names[i]} (текущее)"
+    else
+      say "  $((i + 1))) ${names[i]}"
+    fi
+  done
+  while true; do
+    choice="$(ask_value "Приложение (номер, 0 — отмена)" "$def")"
+    if [[ "$choice" == "0" ]]; then
+      rm -rf "$tmp"
+      return 1
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then break; fi
+    warn "введите номер из списка."
+  done
+  SITE_NAME="${names[$((choice - 1))]}"
+  SITE_SRC_DIR="$base/$SITE_NAME"
+  SITE_TMP="$tmp"
+}
+
+# Установить / переустановить Docker-приложение для домена. Результат: SITE_UP, SITE_NAME (шаблон). return 1 — отмена.
+app_install() {
+  local d="$1" cur_tpl="" dir comp src bak
+  require_docker
+  dir="$(app_dir "$d")"
+  if app_load "$d"; then cur_tpl="$APP_TEMPLATE"; fi
+  app_fetch_template "$cur_tpl" || return 1
+  src="$SITE_SRC_DIR"
+  comp="$(app_find_compose "$src")"
+  if [[ -n "$cur_tpl" && "$cur_tpl" != "$SITE_NAME" ]]; then
+    warn "для $d уже установлено приложение $cur_tpl ($dir) — меняется на $SITE_NAME."
+    if ! prompt_yes_no "Остановить $cur_tpl и перенести его каталог в бэкап?" y; then
+      rm -rf "$SITE_TMP"
+      return 1
+    fi
+    app_dc "$d" down --remove-orphans || warn "не удалось остановить $cur_tpl (продолжаю)."
+    bak="$(apps_dir)/.backup/$d.$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$(dirname "$bak")"
+    mv "$dir" "$bak" 2>/dev/null || run_as_root mv "$dir" "$bak"
+    say "Прежнее приложение: $bak"
+    app_reset_vars
+  elif [[ -n "$cur_tpl" ]]; then
+    say "Для $d уже установлено $cur_tpl — обновляю файлы шаблона (.env и данные сохраняются)."
+  fi
+  app_copy_template "$src" "$dir" "$comp"
+  rm -rf "$SITE_TMP"
+  SITE_TMP=""
+  APP_TEMPLATE="$SITE_NAME"
+  APP_COMPOSE="$comp"
+  app_env_set_domain "$d"
+  app_detect "$dir/$comp.orig"
+  app_ask_mode "$d"
+  app_check_names "$d"
+  app_save "$d"
+  app_apply "$d"
+  SITE_UP="$(app_upstream "$d")"
+  say "Приложение: $dir — $(app_mode_desc "$d")"
+  say "Настройки приложения (пароли, переменные): $dir/.env — после правки: Docker-приложения → Перезапустить."
+}
+
+# Остановить приложение и (по вопросу) удалить его файлы.
+app_remove() {
+  local d="$1" dir
+  dir="$(app_dir "$d")"
+  [[ -d "$dir" ]] || return 0
+  if app_installed "$d"; then
+    app_dc "$d" down --remove-orphans || warn "не удалось остановить приложение (продолжаю)."
+  fi
+  if prompt_yes_no "Удалить файлы и данные приложения $dir? (Нет — останутся для повторной установки)" "$DEFAULT_DELETE_APP_FILES"; then
+    rm -rf "${dir:?}" 2>/dev/null || run_as_root rm -rf "${dir:?}"
+    say "Удалён $dir"
+  else
+    say "Файлы приложения сохранены: $dir"
+  fi
+}
+
+# Контейнеры приложения: «имя: состояние, …».
+app_state_short() {
+  local d="$1" st
+  command -v docker >/dev/null 2>&1 || {
+    echo "docker не найден"
+    return 0
+  }
+  st="$(docker ps -a --filter "label=com.docker.compose.project=$(app_project "$d")" --format '{{.Names}}: {{.State}}' 2>/dev/null | paste -sd ',' - | sed 's/,/, /g' || true)"
+  echo "${st:-контейнеров нет}"
+}
+
+app_status_line() {
+  local d="$1" link="в Caddy не подключено"
+  app_load "$d" || {
+    echo "нет настроек"
+    return 0
+  }
+  if caddy_installed && caddy_has_domain "$d" && [[ "${CADDY_SITES[$CADDY_IDX]}" == docker:* ]]; then
+    link="сайт https://$d/ ($(site_listen_desc "${CADDY_LISTENS[$CADDY_IDX]}"))"
+  fi
+  echo "$APP_TEMPLATE · $(app_mode_desc "$d") · $(app_state_short "$d") · $link"
+}
+
+apps_show() {
+  local d n=0
+  say "Docker-приложения ($(apps_dir)/<домен>/, шаблоны: $SITES_REPO/$SITES_DOCKER_PATH):"
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    n=$((n + 1))
+    printf '  %s — %s\n' "$d" "$(app_status_line "$d")" >&2
+  done <<<"$(apps_list)"
+  if ((n == 0)); then
+    say "  нет. Добавить: Caddy → Сайты → Добавить / изменить сайт → 4 (или $SCRIPT_NAME caddy site set)."
+  fi
+}
+
+# Выбрать приложение. Результат: APP_PICKED. return 1 — отмена / нет приложений.
+app_pick() {
+  local prompt="$1" d i choice
+  local ds=()
+  APP_PICKED=""
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && ds+=("$d")
+  done <<<"$(apps_list)"
+  if ((${#ds[@]} == 0)); then
+    say "Docker-приложений нет. Добавить: Caddy → Сайты → Добавить / изменить сайт → 4."
+    return 1
+  fi
+  for ((i = 0; i < ${#ds[@]}; i++)); do
+    printf ' %2d) %s — %s\n' "$((i + 1))" "${ds[i]}" "$(app_status_line "${ds[i]}")" >&2
+  done
+  choice="$(ask_value "$prompt (Enter — отмена)" "")"
+  [[ -n "$choice" ]] || return 1
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#ds[@]}" ]; then
+    APP_PICKED="${ds[$((choice - 1))]}"
+    return 0
+  fi
+  die "Нет пункта с номером $choice."
+}
+
+# Адрес приложения изменился — обновить up= у сайта в Caddy.
+app_sync_caddy() {
+  local d="$1" new
+  caddy_installed || return 0
+  caddy_has_domain "$d" || return 0
+  [[ "${CADDY_SITES[$CADDY_IDX]}" == docker:* ]] || return 0
+  new="$(app_upstream "$d")"
+  if [[ "${CADDY_UPS[$CADDY_IDX]}" == "$new" && "${CADDY_SITES[$CADDY_IDX]}" == "docker:$APP_TEMPLATE" ]]; then
+    return 0
+  fi
+  CADDY_UPS[CADDY_IDX]="$new"
+  CADDY_SITES[CADDY_IDX]="docker:$APP_TEMPLATE"
+  save_caddy_domains
+  caddy_commit || warn "не удалось применить конфигурацию Caddy."
+  say "Caddy: сайт $d → $new"
+}
+
+# Обновить файлы приложения из репозитория (.env и данные сохраняются).
+app_update_files() {
+  local d="$1" dir base src comp bak
+  app_load "$d" || die "Нет приложения для $d."
+  dir="$(app_dir "$d")"
+  repo_download
+  base="$REPO_ROOT/$SITES_DOCKER_PATH"
+  src="$base/$APP_TEMPLATE"
+  if [[ ! -d "$src" || -z "$(app_find_compose "$src")" ]]; then
+    rm -rf "$REPO_TMP"
+    die "В репозитории нет шаблона $SITES_DOCKER_PATH/$APP_TEMPLATE/."
+  fi
+  comp="$(app_find_compose "$src")"
+  bak="$dir/.remnanode-backup/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$bak"
+  cp -p "$dir/$APP_COMPOSE" "$dir/$APP_COMPOSE.orig" "$dir/.env" "$bak/" 2>/dev/null || true
+  say "Бэкап compose и .env: $bak"
+  if [[ "$comp" != "$APP_COMPOSE" ]]; then
+    rm -f "$dir/$APP_COMPOSE" "$dir/$APP_COMPOSE.orig"
+  fi
+  app_copy_template "$src" "$dir" "$comp"
+  rm -rf "$REPO_TMP"
+  APP_COMPOSE="$comp"
+  app_scan_orig "$dir/$comp.orig"
+  if ! app_compose_scan "$dir/$comp.orig" | grep -qxF "S|$APP_SERVICE"; then
+    warn "в новом шаблоне нет сервиса $APP_SERVICE — выберите заново."
+    APP_MODE=""
+    app_detect "$dir/$comp.orig"
+    app_ask_mode "$d"
+  elif [[ "$APP_MODE" =~ ^(loc|dhost|pub)$ ]] && ((APP_PL == 0)); then
+    warn "в новом шаблоне у $APP_SERVICE нет порта $APP_CPORT — выберите заново."
+    app_detect "$dir/$comp.orig"
+    app_ask_mode "$d"
+  fi
+  app_save "$d"
+  app_apply "$d"
+  app_sync_caddy "$d"
+  say "Приложение $d обновлено из репозитория ($APP_TEMPLATE)."
+}
+
+# Сменить режим порта / подключение к Caddy.
+app_change_port() {
+  local d="$1" dir
+  app_load "$d" || die "Нет приложения для $d."
+  dir="$(app_dir "$d")"
+  say "Сейчас: $(app_mode_desc "$d")"
+  app_scan_orig "$dir/$APP_COMPOSE.orig"
+  app_ask_mode "$d"
+  app_save "$d"
+  app_apply "$d"
+  app_sync_caddy "$d"
+  say "Приложение $d: $(app_mode_desc "$d")"
+}
+
+app_remove_flow() {
+  local d="$1"
+  if caddy_installed && caddy_has_domain "$d" && [[ "${CADDY_SITES[$CADDY_IDX]}" == docker:* ]]; then
+    prompt_yes_no "Приложение — сайт $d в Caddy. Отключить сайт и удалить приложение? (домен и сертификат останутся)" y || {
+      say "Отмена."
+      return 0
+    }
+    CADDY_SITES[CADDY_IDX]="-"
+    CADDY_LISTENS[CADDY_IDX]="-"
+    CADDY_UPS[CADDY_IDX]="-"
+    save_caddy_domains
+    caddy_commit || warn "не удалось применить конфигурацию Caddy."
+    say "Сайт на $d отключён."
+  else
+    prompt_yes_no "Удалить приложение $d (контейнеры будут остановлены)?" y || {
+      say "Отмена."
+      return 0
+    }
+  fi
+  app_remove "$d"
+}
+
+app_follow_logs() {
+  local d="$1"
+  say "Логи (Ctrl+C — выйти из просмотра, приложение продолжит работать)…"
+  trap 'echo' INT
+  app_dc "$d" logs -f -t --tail 200 || true
+  trap - INT
+}
+
+# Действие с приложением. $1: start|stop|restart|logs|pull|update|port|remove, $2: домен (пусто — выбрать).
+app_action() {
+  local act="$1" d="${2:-}"
+  require_docker
+  if [[ -z "$d" ]]; then
+    app_pick "Приложение (номер)" || {
+      say "Отмена."
+      return 0
+    }
+    d="$APP_PICKED"
+  else
+    d="$(normalize_domain "$d")"
+  fi
+  app_installed "$d" || die "Нет Docker-приложения для $d ($(app_dir "$d"))."
+  app_load "$d"
+  case "$act" in
+    start)
+      if [[ "$APP_VIA" == "net" ]]; then web_net_ensure; fi
+      app_dc "$d" up -d
+      ;;
+    stop)
+      app_dc "$d" stop
+      say "Приложение $d остановлено (сайт будет отвечать 502)."
+      ;;
+    restart)
+      if [[ "$APP_VIA" == "net" ]]; then web_net_ensure; fi
+      app_dc "$d" up -d
+      app_dc "$d" restart
+      ;;
+    logs) app_follow_logs "$d" ;;
+    pull)
+      app_dc "$d" pull
+      if [[ "$APP_VIA" == "net" ]]; then web_net_ensure; fi
+      app_dc "$d" up -d
+      if prompt_yes_no "Удалить старые неиспользуемые образы (docker image prune -f)?" "$DEFAULT_PRUNE_IMAGES"; then
+        docker image prune -f
+      fi
+      ;;
+    update) app_update_files "$d" ;;
+    port) app_change_port "$d" ;;
+    remove) app_remove_flow "$d" ;;
+    *) die "app: list | start | stop | restart | logs | pull | update | port | remove [домен]" ;;
+  esac
 }
 
 # =============================================================================
@@ -5072,6 +6492,7 @@ migrate_legacy_hy2() {
   CADDY_TOKENS=("-")
   CADDY_SITES=("-")
   CADDY_LISTENS=("-")
+  CADDY_UPS=("-")
   save_caddy_domains
   caddy_write_all
   write_hy2_compose "$hcompose" "$token" "$port" "$domain"
@@ -5884,12 +7305,13 @@ menu_haproxy() {
 menu_caddy_sites() {
   local c
   while true; do
-    menu_header "Caddy — сайты  [репозиторий: $SITES_REPO/$SITES_PATH]"
+    menu_header "Caddy — сайты  [репозиторий: $SITES_REPO/www]"
     echo " 1) Список сайтов"
-    echo " 2) Добавить / изменить сайт (новый домен или существующий)"
-    echo " 3) Обновить сайт из репозитория"
+    echo " 2) Добавить / изменить сайт (статика, своя папка, прокси, Docker-приложение)"
+    echo " 3) Обновить сайт из репозитория (статика)"
     echo " 4) Порт / доступ: 443, свой порт или локально для Reality"
     echo " 5) Отключить сайт"
+    echo " 6) Docker-приложения…"
     echo " 0) Назад"
     read -r -p "Выберите пункт: " c || exit 0
     case "$(trim "$c")" in
@@ -5898,6 +7320,39 @@ menu_caddy_sites() {
       3) run_action caddy_site_update ;;
       4) run_action caddy_site_listen ;;
       5) run_action caddy_site_remove ;;
+      6) menu_caddy_apps ;;
+      0 | q) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+menu_caddy_apps() {
+  local c
+  while true; do
+    menu_header "Docker-приложения сайтов ($APPS_DIR_NAME)  [шаблоны: $SITES_REPO/$SITES_DOCKER_PATH]"
+    echo " 1) Список и статус"
+    echo " 2) Запустить"
+    echo " 3) Остановить"
+    echo " 4) Перезапустить"
+    echo " 5) Логи"
+    echo " 6) Обновить образы (docker compose pull + запуск)"
+    echo " 7) Обновить файлы из репозитория (.env и данные сохраняются)"
+    echo " 8) Порт / подключение к Caddy"
+    echo " 9) Удалить приложение"
+    echo " 0) Назад"
+    echo " Добавить приложение: «Сайты → 2) Добавить / изменить сайт» → источник 4."
+    read -r -p "Выберите пункт: " c || exit 0
+    case "$(trim "$c")" in
+      1) run_action apps_show ;;
+      2) run_action app_action start ;;
+      3) run_action app_action stop ;;
+      4) run_action app_action restart ;;
+      5) run_action app_action logs ;;
+      6) run_action app_action pull ;;
+      7) run_action app_action update ;;
+      8) run_action app_action port ;;
+      9) run_action app_action remove ;;
       0 | q) return 0 ;;
       *) ;;
     esac
@@ -6004,10 +7459,20 @@ cli_caddy() {
       case "${2:-list}" in
         list | ls) caddy_sites_show ;;
         set | add | edit) caddy_site_set "${3:-}" ;;
+        proxy) caddy_site_proxy "${3:-}" "${4:-}" ;;
         update) caddy_site_update "${3:-}" ;;
         listen | port) caddy_site_listen "${3:-}" "${4:-}" ;;
         remove | rm | del | off) caddy_site_remove "${3:-}" ;;
-        *) die "caddy site: list | set [домен] | update [домен] | listen [домен] [443|pub:ПОРТ|loc:ПОРТ] | remove [домен]" ;;
+        *) die "caddy site: list | set [домен] | proxy [домен] [адрес] | update [домен] | listen [домен] [443|pub:ПОРТ|loc:ПОРТ] | remove [домен]" ;;
+      esac
+      ;;
+    app | apps)
+      case "${2:-list}" in
+        list | ls | status) apps_show ;;
+        start | stop | restart | pull | update | port | remove) app_action "$2" "${3:-}" ;;
+        log | logs) app_action logs "${3:-}" ;;
+        rm | del | delete) app_action remove "${3:-}" ;;
+        *) die "caddy app: list | start | stop | restart | logs | pull | update | port | remove [домен]" ;;
       esac
       ;;
     email) caddy_change_email ;;
